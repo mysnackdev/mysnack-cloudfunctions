@@ -1,0 +1,10 @@
+{
+  "projects": { "default": "my-snack-e52ae" },
+  "targets": {
+    "my-snack-e52ae": {
+      "firestore": {
+        "mydb": ["db-my-snack"]
+      }
+    }
+  }
+}

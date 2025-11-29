@@ -1,0 +1,33 @@
+# Dependencies
+node_modules
+
+# Build outputs
+lib
+dist
+build
+
+# Environment files
+.env
+.env.*
+!.env.example
+.runtimeconfig.json
+
+# Tooling caches
+.turbo
+.parcel-cache
+.eslintcache
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+firebase-debug.log*
+firestore-debug.log*
+storage-debug.log*
+firepit-log*
+
+# Firebase local state
+.firebase
+
+# OS junk
+.DS_Store

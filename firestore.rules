@@ -1,0 +1,82 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() { return request.auth != null; }
+    function isAdmin() { return isSignedIn() && request.auth.token.role == 'shopping-admin'; }
+    function isStoreStaff(storeId) {
+      return isSignedIn() && (isAdmin() || request.auth.token.storeId == storeId);
+    }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function notificationsQueryForUser() {
+      return isSignedIn() &&
+        (
+          request.query == null ||
+          (
+            request.query.where != null &&
+            (
+              (
+                request.query.where.size() > 0 &&
+                request.query.where[0].field == 'userId' &&
+                request.query.where[0].op == '==' &&
+                request.query.where[0].value == request.auth.uid
+              ) ||
+              (
+                request.query.where.size() > 1 &&
+                request.query.where[1].field == 'userId' &&
+                request.query.where[1].op == '==' &&
+                request.query.where[1].value == request.auth.uid
+              ) ||
+              (
+                request.query.where.size() > 2 &&
+                request.query.where[2].field == 'userId' &&
+                request.query.where[2].op == '==' &&
+                request.query.where[2].value == request.auth.uid
+              )
+            )
+          )
+        );
+    }
+
+    match /stores/{storeId} {
+      allow read: if true;
+      allow write: if false;
+    }
+    match /products/{productId} {
+      allow read: if true;
+      allow write: if false;
+    }
+    match /categories/{id} {
+      allow read: if true;
+      allow write: if false;
+    }
+    match /promos/{id} {
+      allow read: if true;
+      allow write: if false;
+    }
+    match /orders/{orderId} {
+      allow read: if isOwner(resource.data.customerId) || isStoreStaff(resource.data.storeId);
+      allow create, update, delete: if false;
+    }
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow write: if isOwner(uid) || isAdmin();
+    }
+    match /notifications/{nid} {
+      allow get, update, delete: if isOwner(resource.data.userId);
+      allow list: if notificationsQueryForUser();
+      allow create: if isOwner(request.resource.data.userId) || isAdmin();
+    }
+    match /menus/{storeId} {
+      allow read: if true;
+      allow write: if false;
+      match /categories/{categoryId} {
+        allow read: if true;
+        allow write: if false;
+        match /items/{itemId} {
+          allow read: if true;
+          allow write: if false;
+        }
+      }
+    }
+  }
+}

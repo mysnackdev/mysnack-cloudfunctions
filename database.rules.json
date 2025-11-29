@@ -1,0 +1,14 @@
+{
+  "rules": {
+    "operatorApprovals": {
+      "$uid": {
+        ".read": "auth != null",
+        ".write": "auth != null && auth.uid === $uid && !data.exists() && newData.exists()",
+        ".validate": "newData.hasChildren(['userId','email','name','cnpj','status','createdAt','updatedAt']) && newData.child('userId').val() === auth.uid && newData.child('email').isString() && newData.child('name').isString() && newData.child('cnpj').isString() && newData.child('cnpj').val().matches(/^[0-9]{14}$/) && newData.child('status').val() === 'pending' && newData.child('createdAt').isString() && newData.child('updatedAt').isString()"
+      },
+      ".indexOn": ["cnpj"]
+    },
+    ".read": "auth != null",
+    ".write": "false"
+  }
+}

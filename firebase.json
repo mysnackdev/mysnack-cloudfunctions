@@ -1,0 +1,32 @@
+{
+  "functions": {
+    "source": ".",
+    "runtime": "nodejs20",
+    "environmentVariables": {
+      "FIRESTORE_DB_ID": "db-my-snack"
+    },
+    "ignore": [
+      "node_modules",
+      ".git",
+      "src",
+      "firebase-debug.log",
+      "firebase-debug.*.log"
+    ],
+    "predeploy": [
+      "npm --prefix \"$RESOURCE_DIR\" run build"
+    ]
+  },
+  "firestore": [
+    {
+      "target": "mydb",
+      "rules": "firestore.rules",
+      "indexes": "firestore.indexes.json"
+    }
+  ],
+  "database": {
+    "rules": "database.rules.json"
+  },
+  "storage": {
+    "rules": "storage.rules"
+  }
+}
