@@ -304,7 +304,8 @@ export const upsertOwnerStore = onCall({ region: "southamerica-east1" }, async (
         logoUrl = data.logoUrl.trim();
       }
     }
-    const rawCnpj = String(data.cnpj || "").replace(/\D/g, "");
+    const rawCpfCnpj = String(data.cpfCnpj || data.cnpj || "").replace(/\D/g, "");
+    const rawCnpj = rawCpfCnpj.length === 14 ? rawCpfCnpj : String(data.cnpj || "").replace(/\D/g, "");
     const storeName = String(data.storeName || "").trim();
     const razaoSocial = String(data.razaoSocial || "").trim();
     const shoppingId = String(data.shoppingId || "").trim();
@@ -317,7 +318,12 @@ export const upsertOwnerStore = onCall({ region: "southamerica-east1" }, async (
       throw new Error("invalid-category");
     }
 
-    if (!storeName || !razaoSocial || !rawCnpj || !shoppingId) {
+    const resolvedCpfCnpj = rawCpfCnpj || rawCnpj;
+    if (!resolvedCpfCnpj || (resolvedCpfCnpj.length !== 11 && resolvedCpfCnpj.length !== 14)) {
+      throw new Error("invalid-cpf-cnpj");
+    }
+
+    if (!storeName || !razaoSocial || !shoppingId) {
       throw new Error("invalid-payload");
     }
 
@@ -326,7 +332,7 @@ export const upsertOwnerStore = onCall({ region: "southamerica-east1" }, async (
     const owner = ownerSnap.data() || {};
     if (owner.role !== "store-owner") throw new Error("permission-denied");
 
-    const storeId = owner.storeId || rawCnpj || uid;
+    const storeId = owner.storeId || resolvedCpfCnpj || rawCnpj || uid;
     const storeRef = db.collection("stores").doc(storeId);
     const existingStoreSnap = await storeRef.get();
     const existingStore = existingStoreSnap.exists ? (existingStoreSnap.data() || {}) : {};
@@ -350,7 +356,9 @@ export const upsertOwnerStore = onCall({ region: "southamerica-east1" }, async (
       ownerEmail: owner.email || null,
       shoppingId,
       shoppingName,
-      cnpj: rawCnpj,
+      cnpj: resolvedCpfCnpj.length === 14 ? resolvedCpfCnpj : null,
+      cpfCnpj: resolvedCpfCnpj,
+      personType: resolvedCpfCnpj.length === 11 ? "FISICA" : "JURIDICA",
       razaoSocial,
       category,
       status,
@@ -704,6 +712,11 @@ export const getStoreConfig = onCall({ region: "southamerica-east1" }, async (re
           configData.ordersActive ??
           (storeData.status && ["approved", "active"].includes(String(storeData.status).toLowerCase()))
       ),
+      autoAcceptOrders: Boolean(
+        configData.autoAcceptOrders ??
+          storeData.autoAcceptOrders ??
+          false
+      ),
       openingHours: sanitizedOpeningHours,
       paymentMethods: sanitizedPaymentMethods,
       deliveryConfig: sanitizedDelivery,
@@ -739,11 +752,18 @@ export const updateStoreConfig = onCall({ region: "southamerica-east1" }, async 
     const storeRef = db.collection("stores").doc(String(resolvedStoreId));
     const storeSnap = await storeRef.get();
     if (!storeSnap.exists) throw new Error("store-not-found");
+    const storeData = storeSnap.data() || {};
+    const baseConfig =
+      storeData.config && typeof storeData.config === "object"
+        ? { ...(storeData.config as Record<string, any>) }
+        : {};
 
     const now = FieldValue.serverTimestamp();
     const storeUpdates: Record<string, any> = { updatedAt: now };
     const userUpdates: Record<string, any> = { updatedAt: now };
     const ownerRealtimeUpdates: Record<string, any> = { updatedAt: Date.now() };
+    const configUpdates: Record<string, any> = { ...baseConfig };
+    let configDirty = false;
 
     const hasLogoField = Object.prototype.hasOwnProperty.call(payload, "logoUrl");
     if (hasLogoField) {
@@ -751,9 +771,8 @@ export const updateStoreConfig = onCall({ region: "southamerica-east1" }, async 
       if (sanitizedLogo) {
         storeUpdates.logoUrl = sanitizedLogo;
         storeUpdates.logoURL = sanitizedLogo;
-        storeUpdates.config = {
-          logoConfigured: true
-        };
+        configUpdates.logoConfigured = true;
+        configDirty = true;
 
         userUpdates.logoUrl = sanitizedLogo;
         userUpdates.logoURL = sanitizedLogo;
@@ -765,9 +784,8 @@ export const updateStoreConfig = onCall({ region: "southamerica-east1" }, async 
       } else {
         storeUpdates.logoUrl = FieldValue.delete();
         storeUpdates.logoURL = FieldValue.delete();
-        storeUpdates.config = {
-          logoConfigured: false
-        };
+        configUpdates.logoConfigured = false;
+        configDirty = true;
 
         userUpdates.logoUrl = FieldValue.delete();
         userUpdates.logoURL = FieldValue.delete();
@@ -777,6 +795,18 @@ export const updateStoreConfig = onCall({ region: "southamerica-east1" }, async 
         ownerRealtimeUpdates.logoURL = null;
         ownerRealtimeUpdates.photoURL = null;
       }
+    }
+
+    if (payload.autoAcceptOrders !== undefined) {
+      const normalized = Boolean(payload.autoAcceptOrders);
+      configUpdates.autoAcceptOrders = normalized;
+      storeUpdates.autoAcceptOrders = normalized;
+      ownerRealtimeUpdates.autoAcceptOrders = normalized;
+      configDirty = true;
+    }
+
+    if (configDirty) {
+      storeUpdates.config = configUpdates;
     }
 
     const writes: Array<Promise<any>> = [

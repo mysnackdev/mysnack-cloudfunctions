@@ -18,6 +18,7 @@ import { getChairsHttp, createChairHttp, updateChairHttp, deleteChairHttp, gener
 import { getUserNotificationsHttp, markNotificationAsReadHttp } from "./notifications.js";
 // Malls / Tables
 import { getMallByQRCodeHttp, getTableInfoHttp, validateTableHttp, listMallsHttp, getMallPaymentMethodsHttp, getMallHttp } from "./malls.js";
+import { createPaymentHttp, getPaymentStatusHttp, asaasWebhookHttp } from "./payments.js";
 
 const handler = withCors(async (req: Request, res: Response) => {
   const p = req.path.replace(/^\/api\/?/, "").replace(/^\//, "").split("?")[0];
@@ -46,6 +47,10 @@ const handler = withCors(async (req: Request, res: Response) => {
     "getActiveOrders": getActiveOrdersHttp,
     "getOrderHistory": getOrderHistoryHttp,
     "getOrdersStats": getOrdersStatsHttp,
+    // Payments (Asaas)
+    "createPayment": createPaymentHttp,
+    "getPaymentStatus": getPaymentStatusHttp,
+    "asaasWebhook": asaasWebhookHttp,
     // Menus
     "getMenu": getMenuHttp,
     "createMenuCategory": createMenuCategoryHttp,
@@ -99,3 +104,4 @@ export * from "./menus.js";
 export * from "./chairs.js";
 export * from "./promos.js";
 export * from "./malls.js";
+export * from "./payments.js";

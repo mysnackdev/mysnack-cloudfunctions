@@ -12,7 +12,7 @@ const FEE_RATE = 0.08;
 function calcTotals(items: Array<{ price: number; qty: number }>) {
   const subtotal = items.reduce((acc, it) => acc + (Number(it.price) * Number(it.qty)), 0);
   const fee = +(subtotal * FEE_RATE).toFixed(2);
-  const total = +(subtotal + fee).toFixed(2);
+  const total = +subtotal.toFixed(2);
   return { subtotal, fee, total };
 }
 
@@ -176,7 +176,7 @@ export const createOrderHttp = onRequest({ region: "southamerica-east1" }, withC
 
 export const updateOrderStatusHttp = onRequest({ region: "southamerica-east1" }, withCors(async (req: Request, res: Response) => {
   const resp = await handleErrors(async () => {
-    const { orderId, status, cancelReason } = updateOrderStatusSchema.parse(req.body || {});
+    const { orderId, status, cancelReason, estimatedTime } = updateOrderStatusSchema.parse(req.body || {});
     const ref = db.collection("orders").doc(orderId);
     const snap = await ref.get();
     if (!snap.exists) throw new Error("order-not-found");
@@ -185,19 +185,23 @@ export const updateOrderStatusHttp = onRequest({ region: "southamerica-east1" },
       'pending': ['accepted','cancelled'],
       'accepted': ['preparing','cancelled'],
       'preparing': ['ready','cancelled'],
-      'ready': ['on-the-way','cancelled'],
+      'ready': ['on-the-way','delivered','cancelled'],
       'on-the-way': ['delivered','cancelled'],
       'delivered': [],
       'cancelled': []
     };
     if (!allowed[from]?.includes(status)) throw new Error("invalid-transition");
     const tsField = statusTimestampField(status);
-    await ref.update({
+    const updates: Record<string, any> = {
       status,
       updatedAt: FieldValue.serverTimestamp(),
       [tsField]: FieldValue.serverTimestamp(),
       cancelReason: status === 'cancelled' ? (cancelReason || 'Sem motivo') : FieldValue.delete()
-    });
+    };
+    if (estimatedTime !== undefined) {
+      updates.estimatedTime = estimatedTime;
+    }
+    await ref.update(updates);
     return { ok: true };
   });
   res.status(resp.success ? 200 : 400).json(resp);
@@ -328,7 +332,7 @@ export const createOrder = onCall({ region: "southamerica-east1" }, async (req) 
 
 export const updateOrderStatus = onCall({ region: "southamerica-east1" }, async (req) => {
   return handleErrors(async () => {
-    const { orderId, status, cancelReason } = req.data as any;
+    const { orderId, status, cancelReason, estimatedTime } = updateOrderStatusSchema.parse(req.data || {});
     if (!orderId || !status) throw new Error("invalid-payload");
     const ref = db.collection("orders").doc(orderId);
     const snap = await ref.get();
@@ -338,7 +342,7 @@ export const updateOrderStatus = onCall({ region: "southamerica-east1" }, async 
       'pending': ['accepted','cancelled'],
       'accepted': ['preparing','cancelled'],
       'preparing': ['ready','cancelled'],
-      'ready': ['on-the-way','cancelled'],
+      'ready': ['on-the-way','delivered','cancelled'],
       'on-the-way': ['delivered','cancelled'],
       'delivered': [],
       'cancelled': []
@@ -350,12 +354,16 @@ export const updateOrderStatus = onCall({ region: "southamerica-east1" }, async 
                     status === 'on-the-way' ? 'onTheWayAt' :
                     status === 'delivered' ? 'deliveredAt' :
                     status === 'cancelled' ? 'cancelledAt' : 'updatedAt';
-    await ref.update({
+    const updates: Record<string, any> = {
       status,
       updatedAt: FieldValue.serverTimestamp(),
       [tsField]: FieldValue.serverTimestamp(),
       cancelReason: status === 'cancelled' ? (cancelReason || 'Sem motivo') : FieldValue.delete()
-    });
+    };
+    if (estimatedTime !== undefined) {
+      updates.estimatedTime = estimatedTime;
+    }
+    await ref.update(updates);
     return { ok: true };
   });
 });
@@ -526,7 +534,7 @@ export const completeOrderDelivery = onCall({ region: "southamerica-east1" }, as
       const canOverride = context.canAccessAllShoppings;
       if (!canOverride && orderShoppingId !== context.shoppingId) throw new Error("permission-denied");
       if (data.assignedWaiterId && data.assignedWaiterId !== context.uid && !canOverride) throw new Error("order-assigned-other");
-      if (data.status !== "on-the-way") throw new Error("order-not-on-the-way");
+      if (data.status !== "on-the-way" && data.status !== "ready") throw new Error("order-not-ready-for-delivery");
 
       tx.update(ref, {
         status: "delivered",

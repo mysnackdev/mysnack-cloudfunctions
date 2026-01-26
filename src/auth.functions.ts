@@ -49,7 +49,13 @@ export const getUserProfile = onCall({ region: "southamerica-east1" }, async (re
     }
 
     const data = snap.data() || {};
-    const role = normalizeRole(data.role ?? authRole);
+    let role = normalizeRole(data.role ?? authRole);
+    if (role === "consumer") {
+      const hasOwnerSignals = Boolean(data.storeName || data.razaoSocial || data.cpfCnpj || data.cnpj || data.storeId);
+      if (hasOwnerSignals) {
+        role = "store-owner";
+      }
+    }
     const status = data.status || getDefaultStatusForRole(role);
     if (data.role !== role || data.status !== status) {
       await ref.set({ role, status, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
@@ -72,7 +78,8 @@ export const updateUserProfile = onCall({ region: "southamerica-east1" }, async 
     if (payload.role) updates.role = String(payload.role);
     if (payload.status) updates.status = String(payload.status);
     if (payload.document) updates.document = String(payload.document);
-    if (payload.birthdate) updates.birthdate = String(payload.birthdate);
+    if (payload.birthDate) updates.birthDate = String(payload.birthDate);
+    if (payload.birthdate) updates.birthDate = String(payload.birthdate);
     if (payload.storeName) updates.storeName = String(payload.storeName);
     if (payload.razaoSocial) updates.razaoSocial = String(payload.razaoSocial);
     if (payload.cnpj) updates.cnpj = String(payload.cnpj).replace(/\D/g, "");
@@ -100,14 +107,26 @@ export const createUserProfile = onCall({ region: "southamerica-east1" }, async 
     const status = statusInput || getDefaultStatusForRole(role);
     const storeName = data.storeName ? String(data.storeName).trim() : null;
     const razaoSocial = data.razaoSocial ? String(data.razaoSocial).trim() : null;
-    const cnpj = data.cnpj ? String(data.cnpj).replace(/\D/g, "") : null;
+    const rawCpfCnpj = data.cpfCnpj ? String(data.cpfCnpj).replace(/\D/g, "") : null;
+    const cnpj = data.cnpj
+      ? String(data.cnpj).replace(/\D/g, "")
+      : rawCpfCnpj && rawCpfCnpj.length === 14
+      ? rawCpfCnpj
+      : null;
+    const cpfCnpj = rawCpfCnpj || cnpj || null;
+    const personType = data.personType
+      ? String(data.personType)
+      : cpfCnpj
+      ? (cpfCnpj.length === 11 ? "FISICA" : "JURIDICA")
+      : null;
     const storeId = data.storeId
       ? String(data.storeId)
-      : role === "store-owner" && cnpj
-        ? cnpj
+      : role === "store-owner" && cpfCnpj
+        ? cpfCnpj
         : null;
     const shoppingId = data.shoppingId ? String(data.shoppingId) : null;
     const phone = data.phone ? String(data.phone) : null;
+    const birthDate = data.birthDate ? String(data.birthDate) : (data.birthdate ? String(data.birthdate) : null);
     const photoURL = data.photoURL ? String(data.photoURL) : null;
     const timestamp = new Date().toISOString();
 
@@ -124,10 +143,13 @@ export const createUserProfile = onCall({ region: "southamerica-east1" }, async 
       role,
       status,
       phone,
+      birthDate,
       photoURL,
       storeName,
       razaoSocial,
       cnpj,
+      cpfCnpj,
+      personType,
       storeId,
       shoppingId,
       ...timestamps,
@@ -141,6 +163,9 @@ export const createUserProfile = onCall({ region: "southamerica-east1" }, async 
         storeName: storeName || null,
         razaoSocial: razaoSocial || null,
         cnpj: cnpj || null,
+        cpfCnpj: cpfCnpj || null,
+        personType: personType || null,
+        birthDate: birthDate || null,
         email,
         status,
         updatedAt: now,

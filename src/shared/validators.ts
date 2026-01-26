@@ -32,7 +32,8 @@ export const createOrderSchema = z.object({
 export const updateOrderStatusSchema = z.object({
   orderId: z.string().min(1),
   status: z.enum(['accepted','preparing','ready','on-the-way','delivered','cancelled']),
-  cancelReason: z.string().optional()
+  cancelReason: z.string().optional(),
+  estimatedTime: z.coerce.number().int().min(0).max(360).optional()
 });
 
 export const chairCreateSchema = z.object({
@@ -149,5 +150,6 @@ export const storeConfigUpdateSchema = z.object({
     z.string().trim().max(2048),
     z.literal(""),
     z.literal(null)
-  ]).optional()
+  ]).optional(),
+  autoAcceptOrders: z.boolean().optional()
 });
