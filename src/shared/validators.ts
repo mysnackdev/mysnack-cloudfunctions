@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+const MAX_TABLES_PER_STORE = 2000;
+
 export const paginationSchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
@@ -18,9 +20,11 @@ export const createOrderSchema = z.object({
     itemId: z.string().min(1),
     productId: z.string().min(1).optional(),
     name: z.string().min(1),
+    description: z.string().trim().max(2000).optional(),
     price: z.number().min(0),
     qty: z.number().int().min(1),
     image: z.union([z.string().trim().min(1).max(2048), z.literal(null)]).optional(),
+    notes: z.string().trim().max(500).optional(),
     modifiers: z.array(z.any()).optional()
   })).min(1),
   paymentMethod: z.string().min(1),
@@ -96,7 +100,9 @@ export const tableRangeSchema = z.object({
   start: z.coerce.number().int().min(1),
   end: z.coerce.number().int().min(1)
 }).refine((range) => range.end >= range.start, { message: "Mesa final deve ser maior ou igual à mesa inicial." })
-.refine((range) => range.end - range.start <= 500, { message: "Intervalo máximo permitido é de 500 mesas." });
+.refine((range) => (range.end - range.start + 1) <= MAX_TABLES_PER_STORE, {
+  message: `Intervalo máximo permitido é de ${MAX_TABLES_PER_STORE} mesas.`,
+});
 
 export const deliveryConfigUpdateSchema = z.object({
   storeId: z.string().min(1),

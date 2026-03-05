@@ -11,6 +11,7 @@ import {
   createSubaccountAccessToken,
   getSubaccount,
   createCustomer,
+  updateCustomer,
   createCharge,
   getCharge,
   getPixQrCode,
@@ -31,11 +32,16 @@ import {
   updateCharge,
   listWebhooks,
   createWebhook,
-  updateWebhook
+  updateWebhook,
+  tokenizeCreditCard
 } from "./payments/asaas.js";
 
 const PLATFORM_FEE_RATE = 0.08;
-const SPLIT_FEE_CENTS = 99;
+const PAYMENT_FEE_CONFIG: Record<string, { fixedFeeCents: number; cardFeeRate: number }> = {
+  pix: { fixedFeeCents: 99, cardFeeRate: 0 },
+  credit: { fixedFeeCents: 99, cardFeeRate: 0.0299 },
+  debit: { fixedFeeCents: 35, cardFeeRate: 0.0189 }
+};
 const WEBHOOK_PAYMENT_EVENTS = [
   "PAYMENT_RECEIVED",
   "PAYMENT_CONFIRMED",
@@ -48,7 +54,7 @@ const WEBHOOK_PAYMENT_EVENTS = [
 ];
 const WEBHOOK_PAID_EVENTS = new Set(["PAYMENT_RECEIVED", "PAYMENT_CONFIRMED", "PAYMENT_APPROVED"]);
 const WEBHOOK_FAILED_EVENTS = new Set(["PAYMENT_OVERDUE", "PAYMENT_CANCELED", "PAYMENT_REFUNDED", "PAYMENT_CHARGEBACK"]);
-const TOKEN_SECRET = normalizeText("$aact_prod_000MzkwODA2MWY2OGM3MWRlMDU2NWM3MzJlNzZmNGZhZGY6OjFiNjZjY2I2LTdiMWMtNDYxYS1hZDY0LWI5NGU4ZGIxNjMzZTo6JGFhY2hfMzE4ZTAzNTctZTQ3OS00Mzk2LWI4MjUtNjY5OGZhYTJhZjNi");
+const TOKEN_SECRET = normalizeText("$aact_prod_000MzkwODA2MWY2OGM3MWRlMDU2NWM3MzJlNzZmNGZhZGY6OjFmNGUyZDMwLTcwNDAtNDEzNy1iMmJjLWZkMTI3NjhmYThlMjo6JGFhY2hfY2Y0ZmNjMGEtM2Y1MC00OGMxLWIzODEtZjFiYTM0ZTk5ZDlm");
 
 const callableOptions = {
   region: "southamerica-east1",
@@ -74,6 +80,11 @@ function normalizePlatformFeeRate(value: any, fallback: number): number {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return fallback;
   return clamp(numeric, 0, 0.5);
+}
+
+export function resolvePaymentFeeConfig(paymentMethod: string | null | undefined) {
+  const method = normalizeText(paymentMethod || "pix").toLowerCase();
+  return PAYMENT_FEE_CONFIG[method] || PAYMENT_FEE_CONFIG.pix;
 }
 
 function normalizeText(value: any): string {
@@ -130,6 +141,76 @@ function pickValue<T>(...values: Array<T | null | undefined>): T | null {
   return null;
 }
 
+function headerToString(value: unknown): string {
+  if (Array.isArray(value)) return String(value[0] ?? "");
+  if (value == null) return "";
+  return String(value);
+}
+
+function isLocalhostRequest(req: Request): boolean {
+  const sources = [
+    headerToString(req.headers.origin),
+    headerToString(req.headers.host),
+    headerToString(req.headers.referer),
+    headerToString(req.headers["x-forwarded-host"])
+  ].map((entry) => entry.toLowerCase());
+  return sources.some((entry) => entry.includes("localhost") || entry.includes("127.0.0.1"));
+}
+
+export function normalizeIntentItem(raw: any): Record<string, any> {
+  const item = typeof raw === "object" && raw ? raw : {};
+  const itemId = pickText(item.itemId, item.itemID, item.id, item.productId, item.productID);
+  const productId = pickText(item.productId, item.productID, item.itemId, item.itemID, item.id);
+  const name = pickText(item.name, item.title, item.label) || "Item";
+  const notes = pickText(item.notes, item.observation, item.observacao);
+  const description = pickText(item.description, item.productDescription, item.desc, item.details);
+  const qtyRaw = Number(item.qty ?? item.quantity ?? item.amount ?? 1);
+  const qty = Number.isFinite(qtyRaw) && qtyRaw > 0 ? Math.round(qtyRaw) : 1;
+  const priceRaw = Number(item.price ?? 0);
+  const price = Number.isFinite(priceRaw) ? priceRaw : 0;
+
+  return {
+    ...item,
+    ...(itemId ? { itemId } : {}),
+    ...(productId ? { productId } : {}),
+    name,
+    qty,
+    price,
+    ...(notes ? { notes } : {}),
+    ...(description ? { description } : {}),
+  };
+}
+
+async function resolveMenuItemDescription(
+  storeId: string,
+  productId: string,
+  cache: Map<string, Promise<string | null>>
+): Promise<string | null> {
+  const normalizedStoreId = normalizeText(storeId);
+  const normalizedProductId = normalizeText(productId);
+  if (!normalizedStoreId || !normalizedProductId) return null;
+
+  const cacheKey = `${normalizedStoreId}:${normalizedProductId}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+
+  const lookup = (async () => {
+    const categoriesSnap = await db.collection("menus").doc(normalizedStoreId).collection("categories").get();
+    if (categoriesSnap.empty) return null;
+    for (const categoryDoc of categoriesSnap.docs) {
+      const itemSnap = await categoryDoc.ref.collection("items").doc(normalizedProductId).get();
+      if (!itemSnap.exists) continue;
+      const data = itemSnap.data() || {};
+      const description = pickText(data.description, data.details, data.desc);
+      if (description) return description;
+    }
+    return null;
+  })();
+
+  cache.set(cacheKey, lookup);
+  return lookup;
+}
+
 function normalizeBalancePayload(balance: any): { available: number; blocked?: number; total?: number } | null {
   if (!balance) return null;
   if (typeof balance === "number") {
@@ -167,47 +248,49 @@ function resolveStoreApiKey(store: any): string | null {
   return normalized || null;
 }
 
-export function computeSplitCents(storeTotals: StoreTotals[], totalCents: number) {
+export function computeSplitCents(
+  storeTotals: StoreTotals[],
+  totalCents: number,
+  options?: { fixedFeeCents?: number; cardFeeRate?: number }
+) {
+  const fixedFeeCents = Math.max(0, Number(options?.fixedFeeCents ?? 0));
+  const cardFeeRate = Math.max(0, Number(options?.cardFeeRate ?? 0));
+
   let platformShareCents = storeTotals.reduce((acc, store) => {
     const rate = normalizePlatformFeeRate(store.platformFeeRate, PLATFORM_FEE_RATE);
     return acc + Math.round(store.subtotalCents * rate);
   }, 0);
+  platformShareCents += fixedFeeCents;
   platformShareCents = Math.min(platformShareCents, totalCents);
+
   let platformFeeAllocated = 0;
   let storeNetAllocated = 0;
+  let cardFeeAllocated = 0;
   const storeSplits = storeTotals.map((store, index) => {
     const isLast = index === storeTotals.length - 1;
     const rate = normalizePlatformFeeRate(store.platformFeeRate, PLATFORM_FEE_RATE);
     const storePlatformFee = isLast
-      ? platformShareCents - platformFeeAllocated
+      ? Math.max(0, platformShareCents - fixedFeeCents - platformFeeAllocated)
       : Math.round(store.subtotalCents * rate);
     platformFeeAllocated += storePlatformFee;
-    const storeNet = store.subtotalCents - storePlatformFee;
+
+    const storeCardFee = Math.round(store.subtotalCents * cardFeeRate);
+    cardFeeAllocated += storeCardFee;
+    const storeNet = Math.max(0, store.subtotalCents - storeCardFee);
     storeNetAllocated += storeNet;
+
     return {
       storeId: store.storeId,
       walletId: store.walletId,
       subtotalCents: store.subtotalCents,
       platformFeeCents: storePlatformFee,
+      cardFeeCents: storeCardFee,
       shareCents: storeNet,
       feeShareCents: 0,
-      fixedValueCents: 0
+      fixedValueCents: storeNet
     };
   });
 
-  let feeAllocated = 0;
-  const netBaseCents = Math.max(0, storeNetAllocated);
-  storeSplits.forEach((split, index) => {
-    const isLast = index === storeSplits.length - 1;
-    const feeShare = isLast
-      ? SPLIT_FEE_CENTS - feeAllocated
-      : Math.round(SPLIT_FEE_CENTS * (netBaseCents > 0 ? split.shareCents / netBaseCents : 0));
-    split.feeShareCents = Math.max(0, feeShare);
-    split.fixedValueCents = Math.max(0, split.shareCents - split.feeShareCents);
-    feeAllocated += split.feeShareCents;
-  });
-
-  const platformFeeShareCents = Math.max(0, SPLIT_FEE_CENTS - feeAllocated);
   let fixedTotal = storeSplits.reduce((acc, split) => acc + split.fixedValueCents, 0);
   if (fixedTotal > totalCents) {
     const scale = totalCents / fixedTotal;
@@ -225,15 +308,16 @@ export function computeSplitCents(storeTotals: StoreTotals[], totalCents: number
     storeSplits,
     platform: {
       platformShareCents,
-      feeShareCents: platformFeeShareCents,
-      expectedPlatformNetCents: platformShareCents - platformFeeShareCents,
-      expectedPlatformRemainderCents: totalCents - fixedTotal
+      feeShareCents: fixedFeeCents,
+      expectedPlatformNetCents: platformShareCents - fixedFeeCents,
+      expectedPlatformRemainderCents: totalCents - (fixedTotal + platformShareCents)
     },
     ledger: {
       totalCents,
       platformShareCents,
-      splitFeeCents: SPLIT_FEE_CENTS,
-      netBaseCents,
+      fixedFeeCents,
+      cardFeeRate,
+      cardFeeAllocatedCents: cardFeeAllocated,
       storeNetAllocatedCents: storeNetAllocated,
       fixedTotalCents: fixedTotal
     }
@@ -295,6 +379,45 @@ async function writeAsaasAudit(action: string, payload: Record<string, any>) {
   });
 }
 
+function getIsoDateKey(value = new Date()) {
+  return value.toISOString().slice(0, 10);
+}
+
+async function recordTokenizeFailure(payload: {
+  uid: string | null;
+  reason: string;
+  message: string;
+  code?: string | number | null;
+  details?: any;
+  meta?: Record<string, any>;
+}) {
+  const dateKey = getIsoDateKey();
+  const docRef = db.collection("asaasTokenizeFailures").doc(dateKey);
+  const reasonKey = payload.reason || "unknown";
+  await docRef.set(
+    {
+      date: dateKey,
+      count: FieldValue.increment(1),
+      reasons: {
+        [reasonKey]: FieldValue.increment(1)
+      },
+      lastErrorAt: FieldValue.serverTimestamp(),
+      lastErrorMessage: payload.message,
+      lastErrorCode: payload.code || null,
+      lastMeta: payload.meta || null
+    },
+    { merge: true }
+  );
+  await writeAsaasAudit("tokenize-failed", {
+    uid: payload.uid,
+    reason: reasonKey,
+    message: payload.message,
+    code: payload.code || null,
+    details: payload.details || null,
+    meta: payload.meta || null
+  });
+}
+
 const paymentNotificationCopy: Record<PaymentNotificationStatus, { title: string; message: string }> = {
   PAID: {
     title: "Pagamento confirmado",
@@ -308,6 +431,31 @@ const paymentNotificationCopy: Record<PaymentNotificationStatus, { title: string
     title: "Pagamento cancelado",
     message: "O pagamento não foi confirmado. Tente novamente."
   }
+};
+
+const mapProfileErrorMessage = (
+  message: string,
+  context: "payment" | "card" = "card",
+  options: { allowDocument?: boolean } = {}
+) => {
+  const normalized = String(message || "").toLowerCase();
+  const allowDocument = options.allowDocument !== false;
+  if (normalized.includes("missing-email") || normalized.includes("invalid-email") || normalized.includes("email")) {
+    return context === "payment"
+      ? "Atualize seu e-mail no cadastro antes de pagar."
+      : "Atualize seu e-mail no cadastro antes de salvar o cartão.";
+  }
+  if (allowDocument && (normalized.includes("missing-document") || normalized.includes("cpf") || normalized.includes("cnpj") || normalized.includes("document"))) {
+    return context === "payment"
+      ? "Atualize seu CPF/CNPJ no cadastro antes de pagar."
+      : "Atualize seu CPF/CNPJ no cadastro antes de salvar o cartão.";
+  }
+  if (normalized.includes("missing-address") || normalized.includes("zipcode") || normalized.includes("address")) {
+    return context === "payment"
+      ? "Atualize seu CEP e número do endereço no cadastro antes de pagar."
+      : "Atualize seu CEP e número do endereço no cadastro antes de salvar o cartão.";
+  }
+  return null;
 };
 
 async function notifyPaymentStatus(
@@ -353,6 +501,65 @@ function isInvalidCustomerError(error: any): boolean {
   return raw.includes("customer") && (raw.includes("inválido") || raw.includes("invalido") || raw.includes("invalid"));
 }
 
+function normalizeDigits(value?: string): string {
+  if (!value) return "";
+  return String(value).replace(/\D/g, "");
+}
+
+async function buildCardHolderInfo(payload: Record<string, any>): Promise<Record<string, any>> {
+  const userId = normalizeText(payload.customerId);
+  if (!userId) throw new Error("customer-id-required");
+
+  const userRef = db.collection("users").doc(userId);
+  const userSnap = await userRef.get();
+  if (!userSnap.exists) {
+    throw new Error("customer-not-found");
+  }
+
+  const userData = userSnap.data() || {};
+  const name = pickText(
+    userData.name,
+    userData.displayName,
+    userData.fullName,
+    userData.storeName,
+    userData.email?.split?.("@")?.[0],
+    "Cliente MySnack"
+  );
+  const email = pickText(userData.email, userData.ownerEmail);
+  const cpfCnpj = normalizeCpfCnpj(
+    payload.document ||
+      userData.document ||
+      userData.cpfCnpj ||
+      userData.cnpj ||
+      userData.cpf
+  );
+  const phone = pickText(userData.phone, userData.mobilePhone);
+  const address = userData.address || {};
+
+  if (!email) throw new Error("missing-email");
+
+  const zipcode = normalizeDigits(address.zipcode);
+  const addressNumber = address.number != null ? String(address.number) : "";
+  if (!zipcode || !addressNumber) {
+    throw new Error("missing-address");
+  }
+
+  return {
+    name,
+    email,
+    ...(cpfCnpj ? { cpfCnpj } : {}),
+    postalCode: zipcode,
+    address: address.street || undefined,
+    addressNumber,
+    addressComplement: address.complement || undefined,
+    province: address.neighborhood || undefined,
+    city: address.city || undefined,
+    state: address.state || undefined,
+    phone: phone || undefined,
+    mobilePhone: phone || undefined,
+  };
+}
+
 async function resolveAsaasCustomerId(
   payload: Record<string, any>,
   options: { forceNew?: boolean } = {}
@@ -373,7 +580,30 @@ async function resolveAsaasCustomerId(
 
   const userData = userSnap.data() || {};
   const cachedCustomerId = normalizeText(userData.asaasCustomerId);
-  if (cachedCustomerId && !options.forceNew) return cachedCustomerId;
+  if (cachedCustomerId && !options.forceNew) {
+    const cpfCnpj = normalizeCpfCnpj(
+      payload.document ||
+        userData.document ||
+        userData.cpfCnpj ||
+        userData.cnpj ||
+        userData.cpf
+    );
+    try {
+      await updateCustomer(
+        cachedCustomerId,
+        cpfCnpj
+          ? { cpfCnpj, notificationDisabled: true }
+          : { notificationDisabled: true }
+      );
+    } catch (error: any) {
+      await writeAsaasAudit("customer-update-notifications-failed", {
+        customerId: cachedCustomerId,
+        uid: userId,
+        message: error?.message || String(error)
+      });
+    }
+    return cachedCustomerId;
+  }
 
   const name = pickText(
     userData.name,
@@ -384,12 +614,16 @@ async function resolveAsaasCustomerId(
     "Cliente MySnack"
   );
   const email = pickText(userData.email, userData.ownerEmail);
-  const cpfCnpj = normalizeCpfCnpj(userData.cpfCnpj || userData.cnpj || userData.cpf || userData.document);
+  const cpfCnpj = normalizeCpfCnpj(
+    payload.document ||
+      userData.document ||
+      userData.cpfCnpj ||
+      userData.cnpj ||
+      userData.cpf
+  );
   const phone = pickText(userData.phone, userData.mobilePhone);
 
-  if (!cpfCnpj) {
-    throw new Error("missing-cpf-cnpj");
-  }
+
 
   if (!email) {
     throw new Error("missing-email");
@@ -398,10 +632,11 @@ async function resolveAsaasCustomerId(
   const customerPayload: Record<string, any> = {
     name,
     email: email || undefined,
-    cpfCnpj: cpfCnpj || undefined,
+    ...(cpfCnpj ? { cpfCnpj } : {}),
     phone: phone || undefined,
     mobilePhone: phone || undefined,
-    externalReference: userId
+    externalReference: userId,
+    notificationDisabled: true
   };
 
   let customer: Record<string, any>;
@@ -584,7 +819,7 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-function buildSubaccountPayload(store: Record<string, any>) {
+export function buildSubaccountPayload(store: Record<string, any>) {
   const commercial = store.asaasCommercialInfo || {};
   const cpfCnpj = normalizeCpfCnpj(store.cnpj || store.cpfCnpj || commercial.cpfCnpj);
   if (!cpfCnpj) throw new Error("missing-cpf-cnpj");
@@ -605,8 +840,8 @@ function buildSubaccountPayload(store: Record<string, any>) {
     addressNumber: commercial.addressNumber || store.addressNumber || undefined,
     complement: commercial.complement || store.addressComplement || undefined,
     province: commercial.province || store.addressNeighborhood || undefined,
-    city: store.city || undefined,
-    state: store.state || undefined
+    city: commercial.city || store.city || undefined,
+    state: commercial.state || store.state || undefined
   };
   return payload;
 }
@@ -697,6 +932,8 @@ async function buildCommercialFallback(uid: string, storeData: Record<string, an
     addressNumber: pickText(storeData?.addressNumber, userData?.addressNumber, ownerData?.addressNumber),
     addressComplement: pickText(storeData?.addressComplement, userData?.addressComplement, ownerData?.addressComplement),
     addressNeighborhood: pickText(storeData?.addressNeighborhood, userData?.addressNeighborhood, ownerData?.addressNeighborhood),
+    city: pickText(storeData?.city, userData?.city, ownerData?.city),
+    state: pickText(storeData?.state, userData?.state, ownerData?.state),
     monthlyRevenue: pickValue(storeData?.monthlyRevenue, userData?.monthlyRevenue, ownerData?.monthlyRevenue),
     asaasCompanyType: pickText(storeData?.asaasCompanyType, userData?.asaasCompanyType, ownerData?.asaasCompanyType)
   };
@@ -820,24 +1057,49 @@ async function processWebhookPayload(payload: any) {
   const paymentId = String(payload?.payment?.id || payload?.paymentId || payload?.id || "");
   if (!paymentId) throw new Error("payment-id-required");
 
+  const eventKey = getWebhookEventKey(payload);
+  const payloadHash = hashPayload(payload);
   const intentSnap = await db.collection("paymentIntents").where("asaasPaymentId", "==", paymentId).limit(1).get();
   if (intentSnap.empty) return { ok: true, skipped: true };
   const intentDoc = intentSnap.docs[0];
   const intent = intentDoc.data() || {};
 
   const eventName = String(payload?.event || payload?.type || "").toUpperCase();
+  const rawEventType = payload?.type || null;
+  const asaasStatus = payload?.payment?.status || payload?.status || null;
+  const asaasStatusUpdatedAt = FieldValue.serverTimestamp();
   if (WEBHOOK_PAID_EVENTS.has(eventName)) {
     if (intent.status !== "PAID") {
       const ordersCreated = Array.isArray(intent.orderIds) && intent.orderIds.length > 0;
       if (!ordersCreated) {
         const orders: string[] = [];
         const itemsByStore: StoreTotals[] = Array.isArray(intent.itemsByStore) ? intent.itemsByStore : [];
+        const descriptionCache = new Map<string, Promise<string | null>>();
         for (const storeTotals of itemsByStore) {
           const storeSnap = await db.collection("stores").doc(storeTotals.storeId).get();
           if (!storeSnap.exists) continue;
           const store = storeSnap.data() || {};
           const orderNumber = Math.floor(100000 + Math.random() * 900000).toString();
           const subtotal = fromCents(storeTotals.subtotalCents);
+          const normalizedItems = await Promise.all(
+            (Array.isArray(storeTotals.items) ? storeTotals.items : []).map(async (rawItem: any) => {
+              const normalized = normalizeIntentItem(rawItem);
+              const hasDescription = Boolean(pickText(normalized.description));
+              if (hasDescription) return normalized;
+              const productId = pickText(normalized.productId, normalized.itemId);
+              if (!productId) return normalized;
+              const menuDescription = await resolveMenuItemDescription(
+                storeTotals.storeId,
+                productId,
+                descriptionCache
+              );
+              if (!menuDescription) return normalized;
+              return {
+                ...normalized,
+                description: menuDescription,
+              };
+            })
+          );
           const doc = {
             storeId: storeTotals.storeId,
             storeName: storeTotals.storeName,
@@ -847,7 +1109,7 @@ async function processWebhookPayload(payload: any) {
             status: "pending",
             tableNumber: intent.tableNumber || null,
             chairId: intent.chairId || null,
-            items: storeTotals.items,
+            items: normalizedItems,
             subtotal,
             fee: 0,
             total: subtotal,
@@ -869,12 +1131,24 @@ async function processWebhookPayload(payload: any) {
           status: "PAID",
           paidAt: FieldValue.serverTimestamp(),
           orderIds: orders,
+          asaasStatus,
+          asaasEventName: eventName || null,
+          asaasEventType: rawEventType,
+          asaasEventKey: eventKey || null,
+          asaasPayloadHash: payloadHash || null,
+          asaasStatusUpdatedAt,
           updatedAt: FieldValue.serverTimestamp()
         });
       } else {
         await intentDoc.ref.update({
           status: "PAID",
           paidAt: FieldValue.serverTimestamp(),
+          asaasStatus,
+          asaasEventName: eventName || null,
+          asaasEventType: rawEventType,
+          asaasEventKey: eventKey || null,
+          asaasPayloadHash: payloadHash || null,
+          asaasStatusUpdatedAt,
           updatedAt: FieldValue.serverTimestamp()
         });
         if (Array.isArray(intent.orderIds) && intent.orderIds.length > 0) {
@@ -910,8 +1184,10 @@ async function processWebhookPayload(payload: any) {
         const discrepancyCents =
           netValueCents != null ? netValueCents - expectedRemainderCents : null;
 
+        const valueCents = charge?.value ? toCents(Number(charge.value)) : null;
         await intentDoc.ref.update({
           asaasChargeSnapshot: charge || null,
+          valueCents,
           netValueCents,
           feeCents,
           expectedRemainderCents,
@@ -938,6 +1214,12 @@ async function processWebhookPayload(payload: any) {
   if (eventName === "PAYMENT_EXPIRED") {
     await intentDoc.ref.update({
       status: "EXPIRED",
+      asaasStatus,
+      asaasEventName: eventName || null,
+      asaasEventType: rawEventType,
+      asaasEventKey: eventKey || null,
+      asaasPayloadHash: payloadHash || null,
+      asaasStatusUpdatedAt,
       updatedAt: FieldValue.serverTimestamp()
     });
     await notifyPaymentStatus(intentDoc, intent, "EXPIRED");
@@ -957,6 +1239,12 @@ async function processWebhookPayload(payload: any) {
   if (WEBHOOK_FAILED_EVENTS.has(eventName)) {
     await intentDoc.ref.update({
       status: "FAILED",
+      asaasStatus,
+      asaasEventName: eventName || null,
+      asaasEventType: rawEventType,
+      asaasEventKey: eventKey || null,
+      asaasPayloadHash: payloadHash || null,
+      asaasStatusUpdatedAt,
       updatedAt: FieldValue.serverTimestamp()
     });
     await notifyPaymentStatus(intentDoc, intent, "FAILED");
@@ -978,6 +1266,596 @@ async function processWebhookPayload(payload: any) {
 }
 
 export const createPaymentHttp = onRequest({ region: "southamerica-east1" }, withCors(async (req: Request, res: Response) => {
+  const resp = await handleErrors(async () => {
+    const payload = req.body || {};
+    console.log("[createPaymentHttp] payload received", {
+      paymentMethod: payload?.paymentMethod || null,
+      customerId: payload?.customerId || null,
+      hasDocument: Boolean(payload?.document),
+      tableNumber: payload?.tableNumber || null,
+      itemsCount: Array.isArray(payload?.items) ? payload.items.length : 0
+    });
+    const paymentMethod = String(payload.paymentMethod || "pix").toLowerCase();
+    try {
+      const items = Array.isArray(payload.items) ? payload.items : [];
+      if (!items.length) throw new Error("items-required");
+
+    const itemsByStore = new Map<string, StoreTotals>();
+    items.forEach((item: any) => {
+      const normalizedItem = normalizeIntentItem(item);
+      const storeId = String(normalizedItem.storeId || "");
+      if (!storeId) return;
+      const current = itemsByStore.get(storeId) || {
+        storeId,
+        storeName: String(normalizedItem.storeName || "Loja"),
+        items: [],
+        subtotalCents: 0,
+        walletId: ""
+      };
+      const itemTotal = Number(normalizedItem.price || 0) * Number(normalizedItem.qty || 0);
+      current.items.push(normalizedItem);
+      current.subtotalCents += toCents(itemTotal);
+      if (normalizedItem.storeName) current.storeName = String(normalizedItem.storeName);
+      itemsByStore.set(storeId, current);
+    });
+
+    if (!itemsByStore.size) throw new Error("stores-required");
+
+    const storeIds = Array.from(itemsByStore.keys());
+    const storeSnaps = await Promise.all(storeIds.map((storeId) => db.collection("stores").doc(storeId).get()));
+    storeSnaps.forEach((snap, index) => {
+      const storeId = storeIds[index];
+      if (!snap.exists) throw new Error(`store-not-found:${storeId}`);
+      const data = snap.data() || {};
+      const storeTotals = itemsByStore.get(storeId);
+      if (!storeTotals) return;
+      storeTotals.storeName = storeTotals.storeName || data.displayName || data.storeName || data.name || "Loja";
+      storeTotals.walletId =
+        data.asaasWalletId ||
+        data.asaasAccountData?.walletId ||
+        data.asaasAccountCreated?.walletId ||
+        data.asaas?.walletId ||
+        "";
+      storeTotals.platformFeeRate = normalizePlatformFeeRate(
+        data?.splitConfig?.platformFeeRate ?? data?.platformFeeRate,
+        PLATFORM_FEE_RATE
+      );
+    });
+
+    const shouldBypassAsaas = isLocalhostRequest(req) && payload?.mockLocalhostSuccess === true;
+    if (shouldBypassAsaas) {
+      const feeConfig = resolvePaymentFeeConfig(paymentMethod);
+      const subtotalCents = Array.from(itemsByStore.values()).reduce((acc, store) => acc + store.subtotalCents, 0);
+      const platformFeeCents = Array.from(itemsByStore.values()).reduce((acc, store) => {
+        const rate = normalizePlatformFeeRate(store.platformFeeRate, PLATFORM_FEE_RATE);
+        return acc + Math.round(store.subtotalCents * rate);
+      }, 0);
+      const totalCents = subtotalCents + platformFeeCents + feeConfig.fixedFeeCents;
+      if (totalCents <= feeConfig.fixedFeeCents) throw new Error("total-too-low");
+
+      const billingType = paymentMethod === "pix" ? "PIX" : "CREDIT_CARD";
+      const mockPaymentId = `mock_local_${Date.now()}`;
+      const descriptionCache = new Map<string, Promise<string | null>>();
+      const createdOrderIds: string[] = [];
+
+      for (const storeTotals of itemsByStore.values()) {
+        const storeSnap = await db.collection("stores").doc(storeTotals.storeId).get();
+        if (!storeSnap.exists) continue;
+        const store = storeSnap.data() || {};
+        const orderNumber = Math.floor(100000 + Math.random() * 900000).toString();
+        const subtotal = fromCents(storeTotals.subtotalCents);
+        const normalizedItems = await Promise.all(
+          (Array.isArray(storeTotals.items) ? storeTotals.items : []).map(async (rawItem: any) => {
+            const normalized = normalizeIntentItem(rawItem);
+            const hasDescription = Boolean(pickText(normalized.description));
+            if (hasDescription) return normalized;
+            const productId = pickText(normalized.productId, normalized.itemId);
+            if (!productId) return normalized;
+            const menuDescription = await resolveMenuItemDescription(
+              storeTotals.storeId,
+              productId,
+              descriptionCache
+            );
+            if (!menuDescription) return normalized;
+            return { ...normalized, description: menuDescription };
+          })
+        );
+
+        const orderDoc = {
+          storeId: storeTotals.storeId,
+          storeName: storeTotals.storeName,
+          shoppingId: store.shoppingId || null,
+          shoppingName: store.shoppingName || null,
+          orderNumber,
+          status: "pending",
+          tableNumber: payload.tableNumber || null,
+          chairId: payload.chairId || null,
+          items: normalizedItems,
+          subtotal,
+          fee: 0,
+          total: subtotal,
+          paymentMethod,
+          paymentProvider: "mock-localhost",
+          paymentStatus: "paid",
+          asaasPaymentId: mockPaymentId,
+          splitComputed: null,
+          customerId: payload.customerId || null,
+          customerSessionId: payload.sessionId || null,
+          createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp()
+        };
+        const orderRef = await db.collection("orders").add(orderDoc);
+        createdOrderIds.push(orderRef.id);
+      }
+
+      const intentRef = await db.collection("paymentIntents").add({
+        items,
+        itemsByStore: Array.from(itemsByStore.values()),
+        storeIds,
+        totalCents,
+        valueCents: totalCents,
+        netValueCents: totalCents,
+        billingType,
+        paymentMethod,
+        asaasPaymentId: mockPaymentId,
+        invoiceUrl: null,
+        splitComputed: null,
+        splitAdjusted: null,
+        status: "PAID",
+        paidAt: FieldValue.serverTimestamp(),
+        orderIds: createdOrderIds,
+        customerId: payload.customerId || null,
+        customerSessionId: payload.sessionId || null,
+        asaasCustomerId: null,
+        tableNumber: payload.tableNumber || null,
+        chairId: payload.chairId || null,
+        feeCents: feeConfig.fixedFeeCents,
+        platformFeeRate: PLATFORM_FEE_RATE,
+        mockBypass: true,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp()
+      });
+
+      return {
+        paymentIntentId: intentRef.id,
+        asaasPaymentId: mockPaymentId,
+        invoiceUrl: null,
+        billingType,
+        mockBypass: true,
+        pix: paymentMethod === "pix"
+          ? {
+              payload: "PAGAMENTO MOCK LOCALHOST",
+              encodedImage: null,
+              expirationDate: null
+            }
+          : null
+      };
+    }
+
+    const invalidStore = Array.from(itemsByStore.values()).find((store) => !store.walletId);
+    if (invalidStore) {
+      throw new Error(`store-asaas-not-configured:${invalidStore.storeId}`);
+    }
+
+    const feeConfig = resolvePaymentFeeConfig(paymentMethod);
+    const subtotalCents = Array.from(itemsByStore.values()).reduce((acc, store) => acc + store.subtotalCents, 0);
+    const platformFeeCents = Array.from(itemsByStore.values()).reduce((acc, store) => {
+      const rate = normalizePlatformFeeRate(store.platformFeeRate, PLATFORM_FEE_RATE);
+      return acc + Math.round(store.subtotalCents * rate);
+    }, 0);
+    const totalCents = subtotalCents + platformFeeCents + feeConfig.fixedFeeCents;
+    if (totalCents <= feeConfig.fixedFeeCents) throw new Error("total-too-low");
+
+    const split = computeSplitCents(Array.from(itemsByStore.values()), totalCents, {
+      fixedFeeCents: feeConfig.fixedFeeCents,
+      cardFeeRate: feeConfig.cardFeeRate
+    });
+    const asaasSplit = split.storeSplits.map((store) => ({
+      walletId: store.walletId,
+      fixedValue: fromCents(store.fixedValueCents)
+    }));
+
+    const cardToken = normalizeText(payload.cardToken);
+    const card = payload.card || null;
+    const isDebit = paymentMethod === "debit";
+    const allowInvoiceFallback = payload.allowInvoiceFallback === true;
+    if (paymentMethod === "credit" && !cardToken && !card && !allowInvoiceFallback) {
+      throw new Error("card-required");
+    }
+
+    const billingType = paymentMethod === "pix"
+      ? "PIX"
+      : "CREDIT_CARD";
+
+    let asaasCustomerId = await resolveAsaasCustomerId(payload);
+    console.log("[createPaymentHttp] resolved customer", {
+      customerId: payload?.customerId || null,
+      asaasCustomerId
+    });
+    const needsCardInfo = paymentMethod !== "pix" && !isDebit && (cardToken || card);
+    const cardHolderInfo = needsCardInfo ? await buildCardHolderInfo(payload) : null;
+    if (needsCardInfo) {
+      console.log("[createPaymentHttp] card holder info ready", {
+        hasHolderInfo: Boolean(cardHolderInfo),
+        hasCpfCnpj: Boolean(cardHolderInfo?.cpfCnpj)
+      });
+    }
+
+    const chargePayload: Record<string, any> = {
+      value: fromCents(totalCents),
+      description: "Pagamento MySnack",
+      dueDate: formatDate(new Date()),
+      billingType,
+      split: asaasSplit,
+      externalReference: payload.externalReference || undefined,
+      customer: asaasCustomerId || undefined,
+      creditCardToken: cardToken || undefined,
+      remoteIp: normalizeText(payload.remoteIp) || undefined
+    };
+    if (card && !isDebit) {
+      const holderName = normalizeText(card.holderName);
+      const number = normalizeDigits(card.number);
+      const expiryMonth = normalizeDigits(card.expiryMonth);
+      const expiryYear = normalizeDigits(card.expiryYear);
+      const ccv = normalizeDigits(card.ccv);
+      if (!holderName || !number || !expiryMonth || !expiryYear || !ccv) {
+        throw new Error("card-incomplete");
+      }
+      chargePayload.creditCard = {
+        holderName,
+        number,
+        expiryMonth,
+        expiryYear,
+        ccv
+      };
+    }
+    if (cardHolderInfo && !isDebit) {
+      chargePayload.creditCardHolderInfo = cardHolderInfo;
+    }
+    const redactedPayload = {
+      billingType: chargePayload.billingType,
+      value: chargePayload.value,
+      splitCount: Array.isArray(asaasSplit) ? asaasSplit.length : 0,
+      hasCardToken: Boolean(cardToken),
+      hasCreditCard: Boolean(chargePayload.creditCard),
+      hasHolderInfo: Boolean(chargePayload.creditCardHolderInfo),
+      customer: asaasCustomerId ? "***" : null,
+      externalReference: chargePayload.externalReference || null
+    };
+    await writeAsaasAudit("charge-request", {
+      paymentMethod,
+      redactedPayload
+    });
+
+    let charge: Record<string, any>;
+    try {
+      charge = await createCharge(chargePayload);
+    } catch (error: any) {
+      await writeAsaasAudit("charge-error", {
+        paymentMethod,
+        message: error?.message || String(error),
+        code: error?.code || null,
+        details: error?.details || null,
+        stage: "createCharge"
+      });
+      if (isInvalidCustomerError(error) && payload.customerId) {
+        const userRef = db.collection("users").doc(String(payload.customerId));
+        await userRef.set(
+          { asaasCustomerId: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() },
+          { merge: true }
+        );
+        asaasCustomerId = await resolveAsaasCustomerId(payload, { forceNew: true });
+        await writeAsaasAudit("charge-request-retry", {
+          paymentMethod,
+          redactedPayload: { ...redactedPayload, retryReason: "invalid-customer" }
+        });
+        charge = await createCharge({ ...chargePayload, customer: asaasCustomerId });
+      } else {
+        throw error;
+      }
+    }
+    await writeAsaasAudit("charge-response", {
+      paymentMethod,
+      asaasPaymentId: charge?.id || null,
+      status: charge?.status || null
+    });
+    const fixedTotalCents = split.storeSplits.reduce((acc, item) => acc + item.fixedValueCents, 0);
+    let splitAdjusted: any = null;
+    if (charge?.netValue && fixedTotalCents > 0) {
+      const netValueCents = toCents(Number(charge.netValue));
+      if (netValueCents > 0 && fixedTotalCents > netValueCents) {
+        let percentAllocated = 0;
+        const percentSplits = split.storeSplits.map((store, index) => {
+          const isLast = index === split.storeSplits.length - 1;
+          const percent = isLast
+            ? +(100 - percentAllocated).toFixed(2)
+            : +((store.fixedValueCents / fixedTotalCents) * 100).toFixed(2);
+          percentAllocated += percent;
+          return { walletId: store.walletId, percentage: percent };
+        });
+        await updateCharge(String(charge.id), { split: percentSplits });
+        splitAdjusted = {
+          reason: "netValue-lower-than-fixed",
+          netValueCents,
+          fixedTotalCents,
+          mode: "percentage",
+          split: percentSplits
+        };
+      }
+    }
+    let pixPayload: any = null;
+    if (billingType === "PIX") {
+      pixPayload = await getPixQrCode(String(charge.id));
+    }
+
+    const valueCents = charge?.value ? toCents(Number(charge.value)) : totalCents;
+    const netValueCents = charge?.netValue ? toCents(Number(charge.netValue)) : null;
+
+    const intentRef = await db.collection("paymentIntents").add({
+      items: items,
+      itemsByStore: Array.from(itemsByStore.values()),
+      storeIds: storeIds,
+      totalCents,
+      valueCents,
+      netValueCents,
+      billingType,
+      paymentMethod,
+      asaasPaymentId: charge.id || null,
+      invoiceUrl: charge.invoiceUrl || null,
+      splitComputed: split,
+      splitAdjusted,
+      status: "WAITING_PAYMENT",
+      customerId: payload.customerId || null,
+      customerSessionId: payload.sessionId || null,
+      asaasCustomerId: asaasCustomerId || null,
+      tableNumber: payload.tableNumber || null,
+      chairId: payload.chairId || null,
+      feeCents: feeConfig.fixedFeeCents,
+      platformFeeRate: PLATFORM_FEE_RATE,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp()
+    });
+
+    await writeAsaasAudit("payment-created", {
+      paymentIntentId: intentRef.id,
+      paymentMethod,
+      billingType,
+      totalCents,
+      splitComputed: split
+    });
+
+      return {
+        paymentIntentId: intentRef.id,
+        asaasPaymentId: charge.id || null,
+        invoiceUrl: charge.invoiceUrl || null,
+        billingType,
+        pix: pixPayload
+          ? {
+              payload: pixPayload.payload || pixPayload.qrCode || null,
+              encodedImage: pixPayload.encodedImage || pixPayload.qrCode || null,
+              expirationDate: pixPayload.expirationDate || null
+            }
+          : null
+      };
+    } catch (error: any) {
+      await writeAsaasAudit("charge-error", {
+        paymentMethod,
+        message: error?.message || String(error),
+        code: error?.code || null,
+        details: error?.details || null,
+        stage: "createPayment"
+      });
+      const mapped = mapProfileErrorMessage(
+        error?.message,
+        "payment",
+        { allowDocument: paymentMethod !== "pix" }
+      );
+      if (mapped) throw new Error(mapped);
+      throw error;
+    }
+  });
+
+  res.status(resp.success ? 200 : 400).json(resp);
+}));
+
+export const tokenizeCardHttp = onRequest({ region: "southamerica-east1" }, withCors(async (req: Request, res: Response) => {
+  const mapTokenizeErrorMessage = (message: string, asaasError?: { code?: string; description?: string } | null) => {
+    const combined = `${message} ${asaasError?.description || ""}`.toLowerCase();
+    const mappedProfile = mapProfileErrorMessage(combined, "card");
+    if (mappedProfile) return mappedProfile;
+    if (combined.includes("gerente de conta") || combined.includes("gerente da conta")) {
+      return "Cadastro de cartão indisponível no momento. Tente novamente mais tarde.";
+    }
+    if (combined.includes("forma de pagamento") && combined.includes("desativado")) {
+      return "Cadastro de cartão temporariamente indisponível. Tente novamente mais tarde.";
+    }
+    return message;
+  };
+
+  const resp = await handleErrors(async () => {
+    const uid = (req as any)?.auth?.uid || null;
+    if (!uid) throw new Error("auth-required");
+    const payload = req.body || {};
+    const type = String(payload.type || "credit").toLowerCase();
+    if (type === "debit") throw new Error("debit-not-supported");
+
+    const card = payload.card || payload;
+    const holderName = normalizeText(card.holderName || card.name);
+    const number = normalizeDigits(card.number);
+    const expiryMonth = normalizeDigits(card.expiryMonth || card.expiryMonth);
+    const expiryYearRaw = normalizeDigits(card.expiryYear || card.expiryYear);
+    const expiryYear = expiryYearRaw.length === 2 ? `20${expiryYearRaw}` : expiryYearRaw;
+    const ccv = normalizeDigits(card.ccv || card.cvv);
+    if (!holderName || !number || !expiryMonth || !expiryYear || !ccv) {
+      throw new Error("card-incomplete");
+    }
+
+    const forwarded = req.headers["x-forwarded-for"];
+    const forwardedValue = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+    const remoteIp =
+      normalizeText(payload.remoteIp) ||
+      normalizeText(forwardedValue?.split?.(",")?.[0]) ||
+      normalizeText((req as any).ip) ||
+      normalizeText(req.socket?.remoteAddress);
+
+    const asaasCustomerId = await resolveAsaasCustomerId({ customerId: uid });
+    const cardHolderInfo = await buildCardHolderInfo({ customerId: uid });
+    let tokenResponse: any;
+    try {
+      tokenResponse = await tokenizeCreditCard({
+        customer: asaasCustomerId,
+        creditCard: {
+          holderName,
+          number,
+          expiryMonth,
+          expiryYear,
+          ccv
+        },
+        creditCardHolderInfo: cardHolderInfo,
+        ...(remoteIp ? { remoteIp } : {})
+      });
+    } catch (error: any) {
+      const message = error?.message || "tokenize-failed";
+      const asaasError = error?.details?.errors?.[0] || null;
+      const lastDigits = normalizeDigits(number).slice(-4);
+      const reason = /preenchimento das formas de pagamento.*desativado/i.test(message)
+        ? "payment-methods-disabled"
+        : String(error?.code || asaasError?.code || "tokenize-error");
+      await recordTokenizeFailure({
+        uid,
+        reason,
+        message,
+        code: error?.code || asaasError?.code || null,
+        details: asaasError ? { code: asaasError.code, description: asaasError.description } : null,
+        meta: {
+          lastDigits,
+          expiryMonth,
+          expiryYear,
+          hasHolderName: Boolean(holderName),
+          holderNameLength: holderName?.length || 0,
+          hasCustomer: Boolean(asaasCustomerId)
+        }
+      });
+      await writeAsaasAudit("tokenize-error", {
+        uid,
+        code: asaasError?.code || error?.code || null,
+        description: asaasError?.description || null,
+        message,
+        reason,
+        hasCustomer: Boolean(asaasCustomerId)
+      });
+      const friendlyMessage = mapTokenizeErrorMessage(message, asaasError);
+      if (friendlyMessage !== message) {
+        throw new Error(friendlyMessage);
+      }
+      throw error;
+    }
+
+    const token = normalizeText(tokenResponse?.creditCardToken || tokenResponse?.token);
+    if (!token) throw new Error("card-token-missing");
+    const brand = normalizeText(tokenResponse?.creditCardBrand || payload.brand || "Cartão");
+    const lastDigits = normalizeDigits(tokenResponse?.creditCardNumber || number).slice(-4);
+
+    const cardsRef = db.collection("users").doc(uid).collection("savedCards");
+    const shouldDefault = payload.isDefault === true;
+    const existing = await cardsRef.limit(1).get();
+    const isDefault = shouldDefault || existing.empty;
+    if (shouldDefault) {
+      const existingDefault = await cardsRef.where("isDefault", "==", true).get();
+      if (!existingDefault.empty) {
+        await Promise.all(existingDefault.docs.map((doc) => doc.ref.update({ isDefault: false })));
+      }
+    }
+
+    const docRef = cardsRef.doc();
+    const cardDoc = {
+      brand: brand || "Cartão",
+      lastDigits,
+      expiryMonth,
+      expiryYear,
+      expiryDate: `${expiryMonth}/${expiryYear.slice(-2)}`,
+      holderName,
+      token,
+      type: "credit",
+      isDefault,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp()
+    };
+    await docRef.set(cardDoc);
+
+    return { id: docRef.id, ...cardDoc };
+  });
+  res.status(resp.success ? 200 : 400).json(resp);
+}));
+
+export const listSavedCardsHttp = onRequest({ region: "southamerica-east1" }, withCors(async (req: Request, res: Response) => {
+  const resp = await handleErrors(async () => {
+    try {
+      const uid = (req as any)?.auth?.uid || null;
+      if (!uid) throw new Error("auth-required");
+      const snap = await db.collection("users").doc(uid).collection("savedCards").orderBy("createdAt", "desc").get();
+      return { items: snap.docs.map((doc) => ({ id: doc.id, ...doc.data() })) };
+    } catch (error: any) {
+      const mapped = mapProfileErrorMessage(error?.message, "card");
+      if (mapped) throw new Error(mapped);
+      throw error;
+    }
+  });
+  res.status(resp.success ? 200 : 400).json(resp);
+}));
+
+export const deleteSavedCardHttp = onRequest({ region: "southamerica-east1" }, withCors(async (req: Request, res: Response) => {
+  const resp = await handleErrors(async () => {
+    try {
+      const uid = (req as any)?.auth?.uid || null;
+      if (!uid) throw new Error("auth-required");
+      const cardId = String(req.body?.cardId || req.query?.cardId || "").trim();
+      if (!cardId) throw new Error("card-id-required");
+      const ref = db.collection("users").doc(uid).collection("savedCards").doc(cardId);
+      const snap = await ref.get();
+      if (!snap.exists) throw new Error("card-not-found");
+      const wasDefault = Boolean(snap.get("isDefault"));
+
+      await ref.delete();
+
+      if (wasDefault) {
+        const remaining = await db.collection("users").doc(uid).collection("savedCards")
+          .orderBy("createdAt", "desc")
+          .limit(1)
+          .get();
+        if (!remaining.empty) {
+          await remaining.docs[0].ref.update({ isDefault: true, updatedAt: FieldValue.serverTimestamp() });
+        }
+      }
+
+      return { ok: true, id: cardId };
+    } catch (error: any) {
+      const mapped = mapProfileErrorMessage(error?.message, "card");
+      if (mapped) throw new Error(mapped);
+      throw error;
+    }
+  });
+  res.status(resp.success ? 200 : 400).json(resp);
+}));
+
+export const getPaymentStatusHttp = onRequest({ region: "southamerica-east1" }, withCors(async (req: Request, res: Response) => {
+  const resp = await handleErrors(async () => {
+    try {
+      const intentId = String(req.query.intentId || req.query.paymentIntentId || "");
+      if (!intentId) throw new Error("intentId-required");
+      const snap = await db.collection("paymentIntents").doc(intentId).get();
+      if (!snap.exists) throw new Error("payment-intent-not-found");
+      return { id: snap.id, ...snap.data() };
+    } catch (error: any) {
+      const mapped = mapProfileErrorMessage(error?.message, "payment");
+      if (mapped) throw new Error(mapped);
+      throw error;
+    }
+  });
+  res.status(resp.success ? 200 : 404).json(resp);
+}));
+
+export const getPaymentQuoteHttp = onRequest({ region: "southamerica-east1" }, withCors(async (req: Request, res: Response) => {
   const resp = await handleErrors(async () => {
     const payload = req.body || {};
     const paymentMethod = String(payload.paymentMethod || "pix").toLowerCase();
@@ -1008,157 +1886,33 @@ export const createPaymentHttp = onRequest({ region: "southamerica-east1" }, wit
     const storeSnaps = await Promise.all(storeIds.map((storeId) => db.collection("stores").doc(storeId).get()));
     storeSnaps.forEach((snap, index) => {
       const storeId = storeIds[index];
-      if (!snap.exists) throw new Error(`store-not-found:${storeId}`);
+      if (!snap.exists) return;
       const data = snap.data() || {};
       const storeTotals = itemsByStore.get(storeId);
       if (!storeTotals) return;
       storeTotals.storeName = storeTotals.storeName || data.displayName || data.storeName || data.name || "Loja";
-      storeTotals.walletId =
-        data.asaasWalletId ||
-        data.asaasAccountData?.walletId ||
-        data.asaasAccountCreated?.walletId ||
-        data.asaas?.walletId ||
-        "";
       storeTotals.platformFeeRate = normalizePlatformFeeRate(
         data?.splitConfig?.platformFeeRate ?? data?.platformFeeRate,
         PLATFORM_FEE_RATE
       );
     });
 
-    const invalidStore = Array.from(itemsByStore.values()).find((store) => !store.walletId);
-    if (invalidStore) {
-      throw new Error(`store-asaas-not-configured:${invalidStore.storeId}`);
-    }
-
-    const totalCents = Array.from(itemsByStore.values()).reduce((acc, store) => acc + store.subtotalCents, 0);
-    if (totalCents <= SPLIT_FEE_CENTS) throw new Error("total-too-low");
-
-    const split = computeSplitCents(Array.from(itemsByStore.values()), totalCents);
-    const asaasSplit = split.storeSplits.map((store) => ({
-      walletId: store.walletId,
-      fixedValue: fromCents(store.fixedValueCents)
-    }));
-
-    const billingType = paymentMethod === "pix"
-      ? "PIX"
-      : (payload.cardToken ? "CREDIT_CARD" : "UNDEFINED");
-
-    let asaasCustomerId = await resolveAsaasCustomerId(payload);
-
-    const chargePayload: Record<string, any> = {
-      value: fromCents(totalCents),
-      description: "Pagamento MySnack",
-      dueDate: formatDate(new Date()),
-      billingType,
-      split: asaasSplit,
-      externalReference: payload.externalReference || undefined,
-      customer: asaasCustomerId || undefined,
-      creditCardToken: payload.cardToken || undefined
-    };
-    let charge: Record<string, any>;
-    try {
-      charge = await createCharge(chargePayload);
-    } catch (error: any) {
-      if (isInvalidCustomerError(error) && payload.customerId) {
-        const userRef = db.collection("users").doc(String(payload.customerId));
-        await userRef.set(
-          { asaasCustomerId: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() },
-          { merge: true }
-        );
-        asaasCustomerId = await resolveAsaasCustomerId(payload, { forceNew: true });
-        charge = await createCharge({ ...chargePayload, customer: asaasCustomerId });
-      } else {
-        throw error;
-      }
-    }
-    const fixedTotalCents = split.storeSplits.reduce((acc, item) => acc + item.fixedValueCents, 0);
-    let splitAdjusted: any = null;
-    if (charge?.netValue && fixedTotalCents > 0) {
-      const netValueCents = toCents(Number(charge.netValue));
-      if (netValueCents > 0 && fixedTotalCents > netValueCents) {
-        let percentAllocated = 0;
-        const percentSplits = split.storeSplits.map((store, index) => {
-          const isLast = index === split.storeSplits.length - 1;
-          const percent = isLast
-            ? +(100 - percentAllocated).toFixed(2)
-            : +((store.fixedValueCents / fixedTotalCents) * 100).toFixed(2);
-          percentAllocated += percent;
-          return { walletId: store.walletId, percentage: percent };
-        });
-        await updateCharge(String(charge.id), { split: percentSplits });
-        splitAdjusted = {
-          reason: "netValue-lower-than-fixed",
-          netValueCents,
-          fixedTotalCents,
-          mode: "percentage",
-          split: percentSplits
-        };
-      }
-    }
-    let pixPayload: any = null;
-    if (billingType === "PIX") {
-      pixPayload = await getPixQrCode(String(charge.id));
-    }
-
-    const intentRef = await db.collection("paymentIntents").add({
-      items: items,
-      itemsByStore: Array.from(itemsByStore.values()),
-      storeIds: storeIds,
-      totalCents,
-      valueCents: totalCents,
-      billingType,
-      paymentMethod,
-      asaasPaymentId: charge.id || null,
-      invoiceUrl: charge.invoiceUrl || null,
-      splitComputed: split,
-      splitAdjusted,
-      status: "WAITING_PAYMENT",
-      customerId: payload.customerId || null,
-      customerSessionId: payload.sessionId || null,
-      asaasCustomerId: asaasCustomerId || null,
-      tableNumber: payload.tableNumber || null,
-      chairId: payload.chairId || null,
-      feeCents: SPLIT_FEE_CENTS,
-      platformFeeRate: PLATFORM_FEE_RATE,
-      createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp()
-    });
-
-    await writeAsaasAudit("payment-created", {
-      paymentIntentId: intentRef.id,
-      paymentMethod,
-      billingType,
-      totalCents,
-      splitComputed: split
-    });
+    const feeConfig = resolvePaymentFeeConfig(paymentMethod);
+    const subtotalCents = Array.from(itemsByStore.values()).reduce((acc, store) => acc + store.subtotalCents, 0);
+    const platformFeeCents = Array.from(itemsByStore.values()).reduce((acc, store) => {
+      const rate = normalizePlatformFeeRate(store.platformFeeRate, PLATFORM_FEE_RATE);
+      return acc + Math.round(store.subtotalCents * rate);
+    }, 0);
+    const totalCents = subtotalCents + platformFeeCents + feeConfig.fixedFeeCents;
+    if (totalCents <= feeConfig.fixedFeeCents) throw new Error("total-too-low");
 
     return {
-      paymentIntentId: intentRef.id,
-      asaasPaymentId: charge.id || null,
-      invoiceUrl: charge.invoiceUrl || null,
-      billingType,
-      pix: pixPayload
-        ? {
-            payload: pixPayload.payload || pixPayload.qrCode || null,
-            encodedImage: pixPayload.encodedImage || pixPayload.qrCode || null,
-            expirationDate: pixPayload.expirationDate || null
-          }
-        : null
+      paymentMethod,
+      subtotalCents,
+      totalCents
     };
   });
-
   res.status(resp.success ? 200 : 400).json(resp);
-}));
-
-export const getPaymentStatusHttp = onRequest({ region: "southamerica-east1" }, withCors(async (req: Request, res: Response) => {
-  const resp = await handleErrors(async () => {
-    const intentId = String(req.query.intentId || req.query.paymentIntentId || "");
-    if (!intentId) throw new Error("intentId-required");
-    const snap = await db.collection("paymentIntents").doc(intentId).get();
-    if (!snap.exists) throw new Error("payment-intent-not-found");
-    return { id: snap.id, ...snap.data() };
-  });
-  res.status(resp.success ? 200 : 404).json(resp);
 }));
 
 export const asaasWebhookHttp = onRequest({ region: "southamerica-east1" }, withCors(async (req: Request, res: Response) => {
@@ -1221,7 +1975,9 @@ export const asaasWebhookHttp = onRequest({ region: "southamerica-east1" }, with
     await writeAsaasAudit("webhook-received", {
       eventKey,
       paymentId: paymentId || null,
-      eventName: eventName || null
+      eventName: eventName || null,
+      payloadStatus: payload?.status || payload?.payment?.status || null,
+      type: payload?.event || payload?.type || null
     });
 
     try {
@@ -1232,7 +1988,12 @@ export const asaasWebhookHttp = onRequest({ region: "southamerica-east1" }, with
         status: result?.skipped ? "skipped" : "processed",
         result
       }, { merge: true });
-      await writeAsaasAudit("webhook-processed", { eventKey, status: result?.status || null });
+      await writeAsaasAudit("webhook-processed", {
+        eventKey,
+        status: result?.status || null,
+        paymentId: paymentId || null,
+        eventName: eventName || null
+      });
       return { ...result, ok: true };
     } catch (error: any) {
       await eventRef.set({
@@ -1290,6 +2051,8 @@ export const getStoreAsaasStatus = onCall(callableOptions, async (req) => {
         addressNumber: userData.addressNumber || null,
         addressComplement: userData.addressComplement || null,
         addressNeighborhood: userData.addressNeighborhood || null,
+        city: userData.city || null,
+        state: userData.state || null,
         monthlyRevenue: userData.monthlyRevenue || null,
         asaasCompanyType: userData.asaasCompanyType || null
       };
@@ -1808,6 +2571,51 @@ export const asaasAdminListPaymentReconciliations = onCall(callableOptions, asyn
       ? items.filter((item: any) => item.discrepancyCents != null && Math.abs(item.discrepancyCents) >= 2)
       : items;
     return { items: filtered };
+  });
+});
+
+export const asaasAdminListPayments = onCall(callableOptions, async (req) => {
+  return handleErrors(async () => {
+    const uid = req.auth?.uid || null;
+    if (!uid) throw new Error("auth-required");
+
+    const limit = Math.min(200, Number(req.data?.limit ?? 50));
+    const status = normalizeText(req.data?.status || "");
+    const storeId = normalizeText(req.data?.storeId || "");
+    const billingType = normalizeText(req.data?.billingType || "");
+    const paymentMethod = normalizeText(req.data?.paymentMethod || "");
+    const search = normalizeText(req.data?.search || "");
+
+    const snap = await db.collection("paymentIntents").orderBy("createdAt", "desc").limit(limit).get();
+    let items = snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+
+    if (status) {
+      items = items.filter((item: any) => String(item.status || "").toUpperCase() === status.toUpperCase());
+    }
+    if (storeId) {
+      items = items.filter((item: any) => Array.isArray(item.storeIds) && item.storeIds.includes(storeId));
+    }
+    if (billingType) {
+      items = items.filter((item: any) => String(item.billingType || "").toUpperCase() === billingType.toUpperCase());
+    }
+    if (paymentMethod) {
+      items = items.filter((item: any) => String(item.paymentMethod || "").toLowerCase() === paymentMethod.toLowerCase());
+    }
+    if (search) {
+      items = items.filter((item: any) => {
+        const haystack = [
+          item.id,
+          item.paymentIntentId,
+          item.asaasPaymentId,
+          item.invoiceUrl
+        ]
+          .map((value) => String(value || "").toLowerCase())
+          .join(" ");
+        return haystack.includes(search.toLowerCase());
+      });
+    }
+
+    return { items };
   });
 });
 

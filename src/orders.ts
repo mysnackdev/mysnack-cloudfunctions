@@ -8,6 +8,16 @@ import { handleErrors } from "./shared/errors.js";
 import { createOrderSchema, updateOrderStatusSchema } from "./shared/validators.js";
 
 const FEE_RATE = 0.08;
+const DEFAULT_STORE_TIMEZONE = "America/Sao_Paulo";
+const WEEKDAY_PT_BR = [
+  "Domingo",
+  "Segunda-feira",
+  "Terça-feira",
+  "Quarta-feira",
+  "Quinta-feira",
+  "Sexta-feira",
+  "Sábado"
+] as const;
 
 function calcTotals(items: Array<{ price: number; qty: number }>) {
   const subtotal = items.reduce((acc, it) => acc + (Number(it.price) * Number(it.qty)), 0);
@@ -26,6 +36,113 @@ function statusTimestampField(status: string) {
     case 'cancelled': return 'cancelledAt';
     default: return 'updatedAt';
   }
+}
+
+function parseTimeToMinutes(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const match = value.trim().match(/^(\d{2}):(\d{2})$/);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  return hours * 60 + minutes;
+}
+
+function getNowInStoreTimezone(timeZone?: string | null) {
+  const formatter = new Intl.DateTimeFormat("pt-BR", {
+    timeZone: timeZone || DEFAULT_STORE_TIMEZONE,
+    weekday: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  });
+  const parts = formatter.formatToParts(new Date());
+  const weekdayRaw = parts.find((p) => p.type === "weekday")?.value || "";
+  const hourRaw = parts.find((p) => p.type === "hour")?.value || "00";
+  const minuteRaw = parts.find((p) => p.type === "minute")?.value || "00";
+  const normalizedWeekday = weekdayRaw
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+  const weekdayIndex = WEEKDAY_PT_BR.findIndex((label) =>
+    label.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase() === normalizedWeekday
+  );
+  return {
+    weekdayIndex: weekdayIndex >= 0 ? weekdayIndex : new Date().getDay(),
+    nowMinutes: (Number(hourRaw) || 0) * 60 + (Number(minuteRaw) || 0)
+  };
+}
+
+function assertStoreCanReceiveOrders(storeData: Record<string, any>) {
+  const isOnline = storeData.isOnline;
+  if (isOnline === false) {
+    throw new Error("store-closed");
+  }
+
+  const openingHours = Array.isArray(storeData.openingHours) ? storeData.openingHours : [];
+  if (!openingHours.length) return;
+
+  const timeZone = typeof storeData.timezone === "string" ? storeData.timezone : DEFAULT_STORE_TIMEZONE;
+  const { weekdayIndex, nowMinutes } = getNowInStoreTimezone(timeZone);
+  const todayLabel = WEEKDAY_PT_BR[weekdayIndex] || WEEKDAY_PT_BR[new Date().getDay()];
+
+  const dayConfig = openingHours.find((item: any) => {
+    const rawDay = String(item?.day || "").trim();
+    if (!rawDay) return false;
+    const normalizedRaw = rawDay.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    const normalizedTarget = todayLabel.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    return normalizedRaw === normalizedTarget;
+  });
+
+  if (!dayConfig) return;
+  if (!dayConfig.isOpen) {
+    throw new Error("store-closed");
+  }
+
+  const openMinutes = parseTimeToMinutes(dayConfig.openTime);
+  const closeMinutes = parseTimeToMinutes(dayConfig.closeTime);
+  if (openMinutes == null || closeMinutes == null) return;
+
+  const isOpenNow = nowMinutes >= openMinutes && nowMinutes < closeMinutes;
+  if (!isOpenNow) {
+    throw new Error("store-closed");
+  }
+
+  const breakStartMinutes = parseTimeToMinutes(dayConfig.breakStart);
+  const breakEndMinutes = parseTimeToMinutes(dayConfig.breakEnd);
+  if (
+    breakStartMinutes != null &&
+    breakEndMinutes != null &&
+    nowMinutes >= breakStartMinutes &&
+    nowMinutes < breakEndMinutes
+  ) {
+    throw new Error("store-closed");
+  }
+}
+
+function pickText(...values: any[]): string | null {
+  for (const value of values) {
+    const text = String(value ?? "").trim();
+    if (text) return text;
+  }
+  return null;
+}
+
+async function resolveMenuItemDescription(storeId: string, productId: string): Promise<string | null> {
+  const normalizedStoreId = String(storeId || "").trim();
+  const normalizedProductId = String(productId || "").trim();
+  if (!normalizedStoreId || !normalizedProductId) return null;
+  const categoriesSnap = await db.collection("menus").doc(normalizedStoreId).collection("categories").get();
+  if (categoriesSnap.empty) return null;
+  for (const categoryDoc of categoriesSnap.docs) {
+    const itemSnap = await categoryDoc.ref.collection("items").doc(normalizedProductId).get();
+    if (!itemSnap.exists) continue;
+    const data = itemSnap.data() || {};
+    const description = pickText(data.description, data.details, data.desc);
+    if (description) return description;
+  }
+  return null;
 }
 
 type WaiterRole =
@@ -131,7 +248,35 @@ export const getOrderHttp = onRequest({ region: "southamerica-east1" }, withCors
 export const createOrderHttp = onRequest({ region: "southamerica-east1" }, withCors(async (req: Request, res: Response) => {
   const resp = await handleErrors(async () => {
     const payload = createOrderSchema.parse(req.body || {});
-    const { subtotal, fee, total } = calcTotals(payload.items);
+    const normalizedItems = await Promise.all(
+      payload.items.map(async (item) => {
+        const notes = pickText(item.notes, (item as any).observation, (item as any).observacao) || undefined;
+        const descriptionFromPayload = pickText(
+          (item as any).description,
+          (item as any).productDescription,
+          (item as any).desc,
+          (item as any).details
+        );
+        if (descriptionFromPayload) {
+          return {
+            ...item,
+            description: descriptionFromPayload,
+            notes,
+          };
+        }
+        const productId = pickText(item.productId, item.itemId);
+        if (!productId) {
+          return { ...item, notes };
+        }
+        const menuDescription = await resolveMenuItemDescription(payload.storeId, productId);
+        return {
+          ...item,
+          ...(menuDescription ? { description: menuDescription } : {}),
+          notes,
+        };
+      })
+    );
+    const { subtotal, fee, total } = calcTotals(normalizedItems);
     const customerId = (req as any).auth?.uid || req.headers["x-mock-uid"] || null;
     const sessionHeader = req.headers["x-session-id"];
     const customerSessionId =
@@ -142,6 +287,7 @@ export const createOrderHttp = onRequest({ region: "southamerica-east1" }, withC
     const storeSnap = await db.collection("stores").doc(payload.storeId).get();
     if (!storeSnap.exists) throw new Error("store-not-found");
     const storeData = storeSnap.data() || {};
+    assertStoreCanReceiveOrders(storeData);
     const storeName = storeData.displayName || storeData.storeName || storeData.name || "Loja";
     const shoppingId = storeData.shoppingId || null;
     const shoppingName = storeData.shoppingName || null;
@@ -154,7 +300,7 @@ export const createOrderHttp = onRequest({ region: "southamerica-east1" }, withC
       status: 'pending',
       tableNumber: payload.tableNumber,
       chairId: payload.chairId || null,
-      items: payload.items,
+      items: normalizedItems,
       subtotal, fee, total,
       paymentMethod: payload.paymentMethod,
       estimatedTime: 0,
@@ -301,6 +447,7 @@ export const createOrder = onCall({ region: "southamerica-east1" }, async (req) 
     const storeSnap = await db.collection("stores").doc(String(payload.storeId)).get();
     if (!storeSnap.exists) throw new Error("store-not-found");
     const storeData = storeSnap.data() || {};
+    assertStoreCanReceiveOrders(storeData);
     const storeName = storeData.displayName || storeData.storeName || storeData.name || "Loja";
     const shoppingId = storeData.shoppingId || null;
     const shoppingName = storeData.shoppingName || null;
@@ -533,8 +680,9 @@ export const completeOrderDelivery = onCall({ region: "southamerica-east1" }, as
       const orderShoppingId = data.shoppingId || null;
       const canOverride = context.canAccessAllShoppings;
       if (!canOverride && orderShoppingId !== context.shoppingId) throw new Error("permission-denied");
-      if (data.assignedWaiterId && data.assignedWaiterId !== context.uid && !canOverride) throw new Error("order-assigned-other");
-      if (data.status !== "on-the-way" && data.status !== "ready") throw new Error("order-not-ready-for-delivery");
+    if (!data.assignedWaiterId) throw new Error("order-not-assigned");
+    if (data.assignedWaiterId !== context.uid && !canOverride) throw new Error("order-assigned-other");
+    if (data.status !== "on-the-way") throw new Error("order-not-ready-for-delivery");
 
       tx.update(ref, {
         status: "delivered",

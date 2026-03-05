@@ -8,7 +8,7 @@ type AsaasConfig = {
 const DEFAULT_BASE_URL = "https://api.asaas.com/v3";
 
 function resolveConfig(apiKeyOverride?: string): AsaasConfig {
-  const apiKey = apiKeyOverride || "$aact_prod_000MzkwODA2MWY2OGM3MWRlMDU2NWM3MzJlNzZmNGZhZGY6OjFiNjZjY2I2LTdiMWMtNDYxYS1hZDY0LWI5NGU4ZGIxNjMzZTo6JGFhY2hfMzE4ZTAzNTctZTQ3OS00Mzk2LWI4MjUtNjY5OGZhYTJhZjNi";
+  const apiKey = apiKeyOverride || "$aact_prod_000MzkwODA2MWY2OGM3MWRlMDU2NWM3MzJlNzZmNGZhZGY6OjFmNGUyZDMwLTcwNDAtNDEzNy1iMmJjLWZkMTI3NjhmYThlMjo6JGFhY2hfY2Y0ZmNjMGEtM2Y1MC00OGMxLWIzODEtZjFiYTM0ZTk5ZDlm";
   if (!apiKey) throw new Error("missing-asaas-api-key");
   const baseUrl = process.env.ASAAS_BASE_URL || DEFAULT_BASE_URL;
   return { apiKey, baseUrl };
@@ -37,7 +37,7 @@ async function asaasRequest<T>(
   const body: any = await res.json().catch(() => ({}));
   if (!res.ok) {
     const message = body?.errors?.[0]?.description || body?.message || "asaas-request-failed";
-    const error: any = new Error(message);
+    const error: any = new Error(String(message));
     error.code = body?.errors?.[0]?.code || res.status;
     error.details = body;
     throw error;
@@ -62,7 +62,7 @@ async function asaasFileRequest(
   if (!res.ok) {
     const body: any = await res.json().catch(() => ({}));
     const message = body?.errors?.[0]?.description || body?.message || "asaas-request-failed";
-    const error: any = new Error(message);
+    const error: any = new Error(String(message));
     error.code = body?.errors?.[0]?.code || res.status;
     error.details = body;
     throw error;
@@ -113,6 +113,13 @@ export async function createCustomer(payload: Record<string, any>) {
   });
 }
 
+export async function updateCustomer(customerId: string, payload: Record<string, any>) {
+  return asaasRequest<Record<string, any>>(`/customers/${customerId}`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
 export async function updateCharge(paymentId: string, payload: Record<string, any>) {
   return asaasRequest<Record<string, any>>(`/payments/${paymentId}`, {
     method: "POST",
@@ -126,6 +133,20 @@ export async function getCharge(paymentId: string) {
 
 export async function getPixQrCode(paymentId: string) {
   return asaasRequest<Record<string, any>>(`/payments/${paymentId}/pixQrCode`, { method: "GET" });
+}
+
+export async function tokenizeCreditCard(payload: Record<string, any>) {
+  try {
+    return await asaasRequest<Record<string, any>>("/creditCard/tokenizeCreditCard", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  } catch (error) {
+    return await asaasRequest<Record<string, any>>("/creditCard/tokenize", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  }
 }
 
 // Subaccount endpoints (use apiKeyOverride from subaccount)

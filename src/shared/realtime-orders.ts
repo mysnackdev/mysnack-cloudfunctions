@@ -35,9 +35,11 @@ type OrderRealtimePayload = {
     itemId?: string | null;
     productId?: string | null;
     name: string;
+    description?: string | null;
     qty: number;
     price?: number | null;
     image?: string | null;
+    notes?: string | null;
   }>;
   createdAt: number;
   updatedAt: number;
@@ -248,9 +250,11 @@ const buildOrderRealtimePayload = (orderId: string, data: Record<string, any>): 
             itemId: identifiers.itemId,
             productId: identifiers.productId,
             name: String(item.name || item.title || "Item"),
+            description: item.description != null ? String(item.description) : null,
             qty,
             price,
             image,
+            notes: item.notes != null ? String(item.notes) : null,
           };
         })()
       }))

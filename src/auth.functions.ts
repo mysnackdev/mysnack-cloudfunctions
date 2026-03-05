@@ -32,6 +32,8 @@ export const getUserProfile = onCall({ region: "southamerica-east1" }, async (re
     const email = req.auth?.token?.email ?? null;
     const name = (req.auth?.token?.name ?? email ?? "Usuário").trim();
     const authRole = normalizeRole(req.auth?.token?.role);
+    const claimStoreId = req.auth?.token?.storeId ? String(req.auth.token.storeId) : null;
+    const claimShoppingId = req.auth?.token?.shoppingId ? String(req.auth.token.shoppingId) : null;
 
     if (!snap.exists) {
       const role = authRole;
@@ -42,10 +44,22 @@ export const getUserProfile = onCall({ region: "southamerica-east1" }, async (re
         name,
         role,
         status,
+        storeId: claimStoreId,
+        shoppingId: claimShoppingId,
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
-      return { id: uid, email, name, role, status, createdAt: nowIso, updatedAt: nowIso };
+      return {
+        id: uid,
+        email,
+        name,
+        role,
+        status,
+        storeId: claimStoreId,
+        shoppingId: claimShoppingId,
+        createdAt: nowIso,
+        updatedAt: nowIso
+      };
     }
 
     const data = snap.data() || {};
@@ -57,10 +71,26 @@ export const getUserProfile = onCall({ region: "southamerica-east1" }, async (re
       }
     }
     const status = data.status || getDefaultStatusForRole(role);
-    if (data.role !== role || data.status !== status) {
-      await ref.set({ role, status, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+    const resolvedStoreId = data.storeId || claimStoreId || null;
+    const resolvedShoppingId = data.shoppingId || claimShoppingId || null;
+    if (
+      data.role !== role ||
+      data.status !== status ||
+      (claimStoreId && !data.storeId) ||
+      (claimShoppingId && !data.shoppingId)
+    ) {
+      await ref.set(
+        {
+          role,
+          status,
+          ...(claimStoreId && !data.storeId ? { storeId: claimStoreId } : {}),
+          ...(claimShoppingId && !data.shoppingId ? { shoppingId: claimShoppingId } : {}),
+          updatedAt: FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
     }
-    return { id: snap.id, ...data, role, status };
+    return { id: snap.id, ...data, role, status, storeId: resolvedStoreId, shoppingId: resolvedShoppingId };
   });
 });
 
@@ -78,6 +108,20 @@ export const updateUserProfile = onCall({ region: "southamerica-east1" }, async 
     if (payload.role) updates.role = String(payload.role);
     if (payload.status) updates.status = String(payload.status);
     if (payload.document) updates.document = String(payload.document);
+    const rawCpfCnpj =
+      payload.cpfCnpj != null
+        ? String(payload.cpfCnpj).replace(/\D/g, "")
+        : payload.document
+          ? String(payload.document).replace(/\D/g, "")
+          : null;
+    const resolvedCpfCnpj = rawCpfCnpj && rawCpfCnpj.length > 0 ? rawCpfCnpj : null;
+    if (resolvedCpfCnpj) {
+      updates.cpfCnpj = resolvedCpfCnpj;
+      if (resolvedCpfCnpj.length === 14) {
+        updates.cnpj = resolvedCpfCnpj;
+      }
+      updates.personType = resolvedCpfCnpj.length === 11 ? "FISICA" : "JURIDICA";
+    }
     if (payload.birthDate) updates.birthDate = String(payload.birthDate);
     if (payload.birthdate) updates.birthDate = String(payload.birthdate);
     if (payload.storeName) updates.storeName = String(payload.storeName);

@@ -48,6 +48,7 @@ const DEFAULT_DELIVERY_CONFIG = {
   estimatedTime: 10,
   tableRanges: [] as Array<{ start: number; end: number }>
 };
+const MAX_TABLES_PER_STORE = 2000;
 
 const STORE_CATEGORY_OPTIONS = [
   { id: "happy-hour", name: "Happy Hour" },
@@ -172,9 +173,76 @@ function sanitizeDeliveryConfig(raw: any) {
   };
 }
 
+function resolveLogoUrl(data: Record<string, any>): string | null {
+  const candidates = [data.logoUrl, data.logoURL, data.logo];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return null;
+}
+
+function resolveStoreGateStatus(data: Record<string, any>) {
+  const configData = (data.config && typeof data.config === "object") ? { ...data.config } : {};
+  const sanitizedOpeningHours = sanitizeOpeningHours(data.openingHours);
+  const sanitizedPaymentMethods = sanitizePaymentMethods(data.paymentMethods);
+  const sanitizedDelivery = sanitizeDeliveryConfig(data.deliveryConfig);
+
+  const hasLogo = Boolean(
+    configData.logoConfigured ??
+      data.logoConfigured ??
+      resolveLogoUrl(data)
+  );
+  const hasMenu = Boolean(
+    configData.menuConfigured ??
+      data.menuConfigured ??
+      (Array.isArray(data.menu?.categories) && data.menu.categories.length > 0)
+  );
+  const hasOpeningHours = Boolean(
+    configData.openingHoursConfigured ??
+      data.openingHoursConfigured ??
+      sanitizedOpeningHours.some((item) => item.isOpen)
+  );
+  const hasPaymentMethods = Boolean(
+    configData.paymentMethodsConfigured ??
+      data.paymentMethodsConfigured ??
+      sanitizedPaymentMethods.some((method) => method.enabled)
+  );
+  const hasDeliveryConfig = Boolean(
+    configData.deliveryConfigured ??
+      data.deliveryConfigured ??
+      (sanitizedDelivery.tableServiceEnabled && (sanitizedDelivery.tableRanges?.length || 0) > 0)
+  );
+
+  const status = String(data.status || "").toLowerCase();
+  const approvedStatus = ["approved", "active"].includes(status);
+  const requestedOnline = Boolean(
+    data.isOnline ??
+      configData.ordersActive ??
+      approvedStatus
+  );
+  // Visibility gate for consumer listing:
+  // keep it minimal to avoid hiding the entire mall when optional setup pieces are missing.
+  // Missing logo must still block visibility, per business rule.
+  const visibilityReady = hasLogo;
+  const isOrdersActive = requestedOnline && approvedStatus && visibilityReady;
+
+  return {
+    hasLogo,
+    hasMenu,
+    hasOpeningHours,
+    hasPaymentMethods,
+    hasDeliveryConfig,
+    isOrdersActive,
+  };
+}
+
 async function _list(query: any) {
   const { page, pageSize } = paginationSchema.parse(query);
-  let q: FirebaseFirestore.Query = db.collection("stores").where("status","in",["approved","active"]);
+  const includeInactive = String(query.includeInactive || "").toLowerCase() === "true";
+  const statusFilter = includeInactive
+    ? ["approved", "active", "inactive"]
+    : ["approved", "active"];
+  let q: FirebaseFirestore.Query = db.collection("stores").where("status","in", statusFilter);
   const shoppingId = typeof query.shoppingId === "string" ? String(query.shoppingId).trim() : "";
   if (shoppingId) {
     q = q.where("shoppingId","==", shoppingId);
@@ -184,8 +252,18 @@ async function _list(query: any) {
     q = q.where("category","==",category);
   }
   const snap = await q.limit(pageSize).get();
-  const items = snap.docs
-    .map((d) => ({ id: d.id, ...d.data() }))
+  const mapped = snap.docs
+    .map((d) => {
+      const data = d.data() || {};
+      const gate = resolveStoreGateStatus(data);
+      return {
+        id: d.id,
+        ...data,
+        isOnline: gate.isOrdersActive,
+      };
+    });
+  const filtered = includeInactive ? mapped : mapped.filter((item: any) => item.isOnline === true);
+  const items = filtered
     .sort((a: any, b: any) => {
       const nameA = String(a.name || a.storeName || "").toLowerCase();
       const nameB = String(b.name || b.storeName || "").toLowerCase();
@@ -200,7 +278,9 @@ async function _list(query: any) {
 async function _getStore(storeId: string) {
   const d = await db.collection("stores").doc(storeId).get();
   if (!d.exists) throw new Error("store-not-found");
-  return { id: d.id, ...d.data() };
+  const data = d.data() || {};
+  const gate = resolveStoreGateStatus(data);
+  return { id: d.id, ...data, isOnline: gate.isOrdersActive };
 }
 
 async function _featured(limit = 8) {
@@ -208,7 +288,14 @@ async function _featured(limit = 8) {
     .where("status","in",["approved","active"])
     .orderBy("rating","desc")
     .limit(limit).get();
-  return { items: snap.docs.map(d => ({ id: d.id, ...d.data() })) };
+  const items = snap.docs
+    .map((d) => {
+      const data = d.data() || {};
+      const gate = resolveStoreGateStatus(data);
+      return { id: d.id, ...data, isOnline: gate.isOrdersActive };
+    })
+    .filter((item) => item.isOnline === true);
+  return { items };
 }
 
 export const getStoreCategoriesHttp = onRequest({ region: "southamerica-east1" }, withCors(async (_req: Request, res: Response) => {
@@ -609,6 +696,12 @@ export const getDeliveryConfig = onCall({ region: "southamerica-east1" }, async 
 export const updateDeliveryConfig = onCall({ region: "southamerica-east1" }, async (req) => {
   return handleErrors(async () => {
     const { storeId, ...rest } = deliveryConfigUpdateSchema.parse(req.data || {});
+    const totalTables = Array.isArray(rest.tableRanges)
+      ? rest.tableRanges.reduce((sum, range) => sum + (range.end - range.start + 1), 0)
+      : 0;
+    if (totalTables > MAX_TABLES_PER_STORE) {
+      throw new Error(`O total máximo permitido é de ${MAX_TABLES_PER_STORE} mesas por loja.`);
+    }
     const sanitized = sanitizeDeliveryConfig(rest);
     const ref = db.collection("stores").doc(storeId);
     await ref.set({
@@ -650,14 +743,8 @@ export const getStoreConfig = onCall({ region: "southamerica-east1" }, async (re
     const sanitizedOpeningHours = sanitizeOpeningHours(storeData.openingHours);
     const sanitizedPaymentMethods = sanitizePaymentMethods(storeData.paymentMethods);
     const sanitizedDelivery = sanitizeDeliveryConfig(storeData.deliveryConfig);
-
-    const logoUrl = (() => {
-      const candidates = [storeData.logoUrl, storeData.logoURL, storeData.logo];
-      for (const candidate of candidates) {
-        if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
-      }
-      return null;
-    })();
+    const gateStatus = resolveStoreGateStatus(storeData);
+    const logoUrl = resolveLogoUrl(storeData);
 
     const bannerUrl = (() => {
       const candidates = [storeData.bannerURL, storeData.bannerUrl, storeData.banner];
@@ -667,26 +754,10 @@ export const getStoreConfig = onCall({ region: "southamerica-east1" }, async (re
       return null;
     })();
 
-    const hasMenu = Boolean(
-      configData.menuConfigured ??
-        storeData.menuConfigured ??
-        (Array.isArray(storeData.menu?.categories) && storeData.menu.categories.length > 0)
-    );
-    const hasOpeningHours = Boolean(
-      configData.openingHoursConfigured ??
-        storeData.openingHoursConfigured ??
-        sanitizedOpeningHours.some((item) => item.isOpen)
-    );
-    const hasPaymentMethods = Boolean(
-      configData.paymentMethodsConfigured ??
-        storeData.paymentMethodsConfigured ??
-        sanitizedPaymentMethods.some((method) => method.enabled)
-    );
-    const hasDeliveryConfig = Boolean(
-      configData.deliveryConfigured ??
-        storeData.deliveryConfigured ??
-        (sanitizedDelivery.tableServiceEnabled && (sanitizedDelivery.tableRanges?.length || 0) > 0)
-    );
+    const hasMenu = gateStatus.hasMenu;
+    const hasOpeningHours = gateStatus.hasOpeningHours;
+    const hasPaymentMethods = gateStatus.hasPaymentMethods;
+    const hasDeliveryConfig = gateStatus.hasDeliveryConfig;
 
     const result = {
       id: storeSnap.id,
@@ -707,11 +778,8 @@ export const getStoreConfig = onCall({ region: "southamerica-east1" }, async (re
       hasOpeningHours,
       hasPaymentMethods,
       hasDeliveryConfig,
-      isOrdersActive: Boolean(
-        storeData.isOnline ??
-          configData.ordersActive ??
-          (storeData.status && ["approved", "active"].includes(String(storeData.status).toLowerCase()))
-      ),
+      hasLogo: gateStatus.hasLogo,
+      isOrdersActive: gateStatus.isOrdersActive,
       autoAcceptOrders: Boolean(
         configData.autoAcceptOrders ??
           storeData.autoAcceptOrders ??

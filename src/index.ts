@@ -18,7 +18,8 @@ import { getChairsHttp, createChairHttp, updateChairHttp, deleteChairHttp, gener
 import { getUserNotificationsHttp, markNotificationAsReadHttp } from "./notifications.js";
 // Malls / Tables
 import { getMallByQRCodeHttp, getTableInfoHttp, validateTableHttp, listMallsHttp, getMallPaymentMethodsHttp, getMallHttp } from "./malls.js";
-import { createPaymentHttp, getPaymentStatusHttp, asaasWebhookHttp } from "./payments.js";
+import { createPaymentHttp, getPaymentStatusHttp, getPaymentQuoteHttp, asaasWebhookHttp, tokenizeCardHttp, listSavedCardsHttp, deleteSavedCardHttp } from "./payments.js";
+import { getClientIpHttp } from "./client-ip.js";
 
 const handler = withCors(async (req: Request, res: Response) => {
   const p = req.path.replace(/^\/api\/?/, "").replace(/^\//, "").split("?")[0];
@@ -50,6 +51,10 @@ const handler = withCors(async (req: Request, res: Response) => {
     // Payments (Asaas)
     "createPayment": createPaymentHttp,
     "getPaymentStatus": getPaymentStatusHttp,
+    "getPaymentQuote": getPaymentQuoteHttp,
+    "tokenizeCard": tokenizeCardHttp,
+    "listSavedCards": listSavedCardsHttp,
+    "deleteSavedCard": deleteSavedCardHttp,
     "asaasWebhook": asaasWebhookHttp,
     // Menus
     "getMenu": getMenuHttp,
@@ -77,6 +82,7 @@ const handler = withCors(async (req: Request, res: Response) => {
     "validateTable": validateTableHttp,
     "listMalls": listMallsHttp,
     "getMallPaymentMethods": getMallPaymentMethodsHttp,
+    "getClientIp": getClientIpHttp,
   };
 
   const routeHandler = routes[p];

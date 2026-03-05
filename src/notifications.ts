@@ -37,11 +37,18 @@ export const getUserNotificationsHttp = onRequest({ region: "southamerica-east1"
       }
     }
 
-    const snap = await baseQuery.get();
+    let snap = await baseQuery.get();
+    if (uid && snap.empty && sessionId) {
+      const fallbackQuery = db.collection("notifications")
+        .where("sessionId","==",sessionId)
+        .orderBy("createdAt","desc")
+        .limit(limit);
+      snap = await fallbackQuery.get();
+    }
     const olderThan = snap.docs.length > 0 ? snap.docs[snap.docs.length - 1] : null;
     const moreQuery = olderThan
       ? await db.collection("notifications")
-        .where(uid ? "userId" : "sessionId","==", uid ?? sessionId)
+        .where(uid && !snap.empty ? "userId" : "sessionId","==", uid && !snap.empty ? uid : sessionId)
         .orderBy("createdAt","desc")
         .startAfter(olderThan)
         .limit(1)
