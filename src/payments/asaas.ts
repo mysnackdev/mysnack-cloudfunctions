@@ -8,7 +8,7 @@ type AsaasConfig = {
 const DEFAULT_BASE_URL = "https://api.asaas.com/v3";
 
 function resolveConfig(apiKeyOverride?: string): AsaasConfig {
-  const apiKey = apiKeyOverride || "$aact_prod_000MzkwODA2MWY2OGM3MWRlMDU2NWM3MzJlNzZmNGZhZGY6OjFmNGUyZDMwLTcwNDAtNDEzNy1iMmJjLWZkMTI3NjhmYThlMjo6JGFhY2hfY2Y0ZmNjMGEtM2Y1MC00OGMxLWIzODEtZjFiYTM0ZTk5ZDlm";
+  const apiKey = apiKeyOverride || "$aact_prod_000MzkwODA2MWY2OGM3MWRlMDU2NWM3MzJlNzZmNGZhZGY6OmUwNGQzODRkLTE3MmYtNDY2OS04ZDMyLWEzNTE0OWJjN2ZlODo6JGFhY2hfODI2MTcyMjAtZjZhZS00ODc5LWJkZDYtODhkMGYwMWU5NWMx";
   if (!apiKey) throw new Error("missing-asaas-api-key");
   const baseUrl = process.env.ASAAS_BASE_URL || DEFAULT_BASE_URL;
   return { apiKey, baseUrl };

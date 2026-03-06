@@ -54,7 +54,7 @@ const WEBHOOK_PAYMENT_EVENTS = [
 ];
 const WEBHOOK_PAID_EVENTS = new Set(["PAYMENT_RECEIVED", "PAYMENT_CONFIRMED", "PAYMENT_APPROVED"]);
 const WEBHOOK_FAILED_EVENTS = new Set(["PAYMENT_OVERDUE", "PAYMENT_CANCELED", "PAYMENT_REFUNDED", "PAYMENT_CHARGEBACK"]);
-const TOKEN_SECRET = normalizeText("$aact_prod_000MzkwODA2MWY2OGM3MWRlMDU2NWM3MzJlNzZmNGZhZGY6OjFmNGUyZDMwLTcwNDAtNDEzNy1iMmJjLWZkMTI3NjhmYThlMjo6JGFhY2hfY2Y0ZmNjMGEtM2Y1MC00OGMxLWIzODEtZjFiYTM0ZTk5ZDlm");
+const TOKEN_SECRET = normalizeText("$aact_prod_000MzkwODA2MWY2OGM3MWRlMDU2NWM3MzJlNzZmNGZhZGY6OmUwNGQzODRkLTE3MmYtNDY2OS04ZDMyLWEzNTE0OWJjN2ZlODo6JGFhY2hfODI2MTcyMjAtZjZhZS00ODc5LWJkZDYtODhkMGYwMWU5NWMx");
 
 const callableOptions = {
   region: "southamerica-east1",
@@ -92,6 +92,28 @@ function normalizeText(value: any): string {
   const text = String(value).trim();
   if (!text || text === "null" || text === "undefined") return "";
   return text;
+}
+
+function normalizeMaybeObjectText(value: any): string {
+  if (value == null) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return normalizeText(value);
+  }
+  if (typeof value !== "object") return "";
+  const candidates = [
+    value.value,
+    value.label,
+    value.name,
+    value.text,
+    value.description,
+    value.code,
+    value.type
+  ];
+  for (const candidate of candidates) {
+    const resolved = normalizeText(candidate);
+    if (resolved) return resolved;
+  }
+  return "";
 }
 
 function normalizeCpfCnpj(value: any): string | null {
@@ -823,6 +845,11 @@ export function buildSubaccountPayload(store: Record<string, any>) {
   const commercial = store.asaasCommercialInfo || {};
   const cpfCnpj = normalizeCpfCnpj(store.cnpj || store.cpfCnpj || commercial.cpfCnpj);
   if (!cpfCnpj) throw new Error("missing-cpf-cnpj");
+  const companyType = normalizeText(
+    normalizeMaybeObjectText(commercial.companyType) ||
+    normalizeMaybeObjectText(store.asaasCompanyType) ||
+    normalizeMaybeObjectText(store.companyType)
+  ) || undefined;
   const payload = {
     name: store.displayName || store.storeName || store.name || commercial.companyName,
     email: store.ownerEmail || store.email || commercial.email,
@@ -833,7 +860,7 @@ export function buildSubaccountPayload(store: Record<string, any>) {
     incomeValue: commercial.incomeValue != null
       ? Number(commercial.incomeValue || 0)
       : Number(store.monthlyRevenue || 0),
-    companyType: commercial.companyType || store.asaasCompanyType || undefined,
+    companyType,
     businessName: commercial.companyName || store.razaoSocial || store.storeName || store.name,
     postalCode: commercial.postalCode || store.addressZip || undefined,
     address: commercial.address || store.addressStreet || undefined,

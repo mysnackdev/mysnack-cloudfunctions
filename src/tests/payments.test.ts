@@ -145,6 +145,25 @@ const testBuildSubaccountPayloadRequiresCpfCnpj = () => {
   }, /missing-cpf-cnpj/);
 };
 
+const testBuildSubaccountPayloadNormalizesCompanyTypeFromObject = () => {
+  const payload = buildSubaccountPayload({
+    cnpj: "12.345.678/0001-99",
+    asaasCommercialInfo: {
+      companyType: { value: "MEI" }
+    }
+  });
+  assert.equal(payload.companyType, "MEI");
+};
+
+const testBuildSubaccountPayloadFallsBackToStoreCompanyType = () => {
+  const payload = buildSubaccountPayload({
+    cnpj: "12.345.678/0001-99",
+    asaasCompanyType: "INDIVIDUAL",
+    asaasCommercialInfo: {}
+  });
+  assert.equal(payload.companyType, "INDIVIDUAL");
+};
+
 const run = () => {
   testSingleStoreSplit();
   testMultiStoreSplit();
@@ -155,6 +174,8 @@ const run = () => {
   testBuildSubaccountPayloadPrefersCommercialCityState();
   testBuildSubaccountPayloadFallsBackToStoreCityState();
   testBuildSubaccountPayloadRequiresCpfCnpj();
+  testBuildSubaccountPayloadNormalizesCompanyTypeFromObject();
+  testBuildSubaccountPayloadFallsBackToStoreCompanyType();
   console.log("payments.test.ts: OK");
 };
 
