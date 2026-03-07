@@ -973,7 +973,25 @@ async function buildCommercialFallback(uid: string, storeData: Record<string, an
   return { storeFallback, commercialInfo };
 }
 
-async function ensureStoreAsaasAccountForStore(storeSnap: FirebaseFirestore.DocumentSnapshot) {
+type EnsureStoreAsaasDeps = {
+  createSubaccount: typeof createSubaccount;
+  getSubaccount: typeof getSubaccount;
+  createSubaccountAccessToken: typeof createSubaccountAccessToken;
+  listWallets: typeof listWallets;
+  fetchStoreAsaasSummary: typeof fetchStoreAsaasSummary;
+  encryptToken: typeof encryptToken;
+};
+
+export async function ensureStoreAsaasAccountForStore(
+  storeSnap: FirebaseFirestore.DocumentSnapshot,
+  deps: Partial<EnsureStoreAsaasDeps> = {}
+) {
+  const createSubaccountFn = deps.createSubaccount || createSubaccount;
+  const getSubaccountFn = deps.getSubaccount || getSubaccount;
+  const createSubaccountAccessTokenFn = deps.createSubaccountAccessToken || createSubaccountAccessToken;
+  const listWalletsFn = deps.listWallets || listWallets;
+  const fetchStoreAsaasSummaryFn = deps.fetchStoreAsaasSummary || fetchStoreAsaasSummary;
+  const encryptTokenFn = deps.encryptToken || encryptToken;
   const store = storeSnap.data() || {};
 
   let asaasAccountId = store.asaasAccountId || null;
@@ -987,7 +1005,7 @@ async function ensureStoreAsaasAccountForStore(storeSnap: FirebaseFirestore.Docu
 
   if (!asaasAccountId) {
     const payload = buildSubaccountPayload(store);
-    const created = await createSubaccount(payload);
+    const created = await createSubaccountFn(payload);
     asaasAccountId = created.id || null;
     asaasAccountData = created;
     asaasAccountCreated = created;
@@ -999,7 +1017,7 @@ async function ensureStoreAsaasAccountForStore(storeSnap: FirebaseFirestore.Docu
 
   if (asaasAccountId) {
     try {
-      const remote = await getSubaccount(asaasAccountId);
+      const remote = await getSubaccountFn(asaasAccountId);
       asaasAccountData = remote || asaasAccountData;
       const remoteAccountNumber = remote?.accountNumber || null;
       if (remoteAccountNumber) asaasAccountNumber = remoteAccountNumber;
@@ -1013,7 +1031,7 @@ async function ensureStoreAsaasAccountForStore(storeSnap: FirebaseFirestore.Docu
   }
 
   if (asaasAccountId && !asaasApiKey) {
-    const tokenResp = await createSubaccountAccessToken(asaasAccountId, { description: "MySnack" });
+    const tokenResp = await createSubaccountAccessTokenFn(asaasAccountId, { description: "MySnack" });
     asaasAccountTokenData = tokenResp || asaasAccountTokenData;
     asaasApiKey = tokenResp?.accessToken || tokenResp?.apiKey || tokenResp?.token || null;
   }
@@ -1029,16 +1047,16 @@ async function ensureStoreAsaasAccountForStore(storeSnap: FirebaseFirestore.Docu
       asaasWalletId = derivedWalletId || asaasWalletId;
     }
     if (!asaasWalletId) {
-      const wallets = await listWallets(asaasApiKey);
+      const wallets = await listWalletsFn(asaasApiKey);
       const first = Array.isArray(wallets?.data) ? wallets.data[0] : wallets?.data || wallets?.wallets?.[0];
       asaasWalletId = first?.id || asaasWalletId;
     }
-    summary = await fetchStoreAsaasSummary(storeSnap, asaasApiKey);
+    summary = await fetchStoreAsaasSummaryFn(storeSnap, asaasApiKey);
     asaasAccountNumber = summary?.asaasAccountNumber || asaasAccountNumber;
     asaasAccountStatus = summary?.asaasAccountStatus || asaasAccountStatus;
   }
 
-  const encrypted = asaasApiKey ? encryptToken(asaasApiKey) : null;
+  const encrypted = asaasApiKey ? encryptTokenFn(asaasApiKey) : null;
   const apiKeyLast4 = asaasApiKey ? String(asaasApiKey).slice(-4) : null;
   await storeSnap.ref.update({
     asaasAccountId,

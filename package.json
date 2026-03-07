@@ -11,7 +11,7 @@
     "seed": "tsx src/scripts/seed.ts",
     "set-claims": "tsx src/scripts/set-claims.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx src/tests/payments.test.ts"
+    "test": "tsx src/tests/payments.test.ts && tsx src/tests/account-creation.test.ts"
   },
   "dependencies": {
     "firebase-admin": "^12.6.0",

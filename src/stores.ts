@@ -74,6 +74,55 @@ const callableOptions = {
   cors: true
 } as const;
 
+export function normalizeUpsertOwnerStoreInput(data: any) {
+  const hasLogoField = Object.prototype.hasOwnProperty.call(data, "logoUrl");
+  let logoUrl: string | null | undefined;
+  if (hasLogoField) {
+    if (data.logoUrl === null || (typeof data.logoUrl === "string" && data.logoUrl.trim().length === 0)) {
+      logoUrl = null;
+    } else if (typeof data.logoUrl === "string") {
+      logoUrl = data.logoUrl.trim();
+    }
+  }
+  const rawCpfCnpj = String(data.cpfCnpj || data.cnpj || "").replace(/\D/g, "");
+  const rawCnpj = rawCpfCnpj.length === 14 ? rawCpfCnpj : String(data.cnpj || "").replace(/\D/g, "");
+  const storeName = String(data.storeName || "").trim();
+  const razaoSocial = String(data.razaoSocial || "").trim();
+  const shoppingId = String(data.shoppingId || "").trim();
+  const shoppingName = data.shoppingName ? String(data.shoppingName) : null;
+  const phone = data.phone ? String(data.phone) : null;
+  const description = data.description ? String(data.description) : null;
+  const rawCategory = String(data.categoryId ?? data.category ?? "").trim().toLowerCase();
+  const { category } = categoryParam.parse({ category: rawCategory });
+  if (!STORE_CATEGORY_IDS.has(category)) {
+    throw new Error("invalid-category");
+  }
+
+  const resolvedCpfCnpj = rawCpfCnpj || rawCnpj;
+  if (!resolvedCpfCnpj || (resolvedCpfCnpj.length !== 11 && resolvedCpfCnpj.length !== 14)) {
+    throw new Error("invalid-cpf-cnpj");
+  }
+
+  if (!storeName || !razaoSocial || !shoppingId) {
+    throw new Error("invalid-payload");
+  }
+
+  return {
+    hasLogoField,
+    logoUrl,
+    rawCpfCnpj,
+    rawCnpj,
+    resolvedCpfCnpj,
+    storeName,
+    razaoSocial,
+    shoppingId,
+    shoppingName,
+    phone,
+    description,
+    category
+  };
+}
+
 const toISOString = (value: any) => {
   if (!value) return null;
   if (typeof value === "string") return value;
@@ -382,37 +431,19 @@ export const upsertOwnerStore = onCall({ region: "southamerica-east1" }, async (
     if (!uid) throw Object.assign(new Error("auth-required"), { status: 401 });
 
     const data = req.data || {};
-    const hasLogoField = Object.prototype.hasOwnProperty.call(data, "logoUrl");
-    let logoUrl: string | null | undefined;
-    if (hasLogoField) {
-      if (data.logoUrl === null || (typeof data.logoUrl === "string" && data.logoUrl.trim().length === 0)) {
-        logoUrl = null;
-      } else if (typeof data.logoUrl === "string") {
-        logoUrl = data.logoUrl.trim();
-      }
-    }
-    const rawCpfCnpj = String(data.cpfCnpj || data.cnpj || "").replace(/\D/g, "");
-    const rawCnpj = rawCpfCnpj.length === 14 ? rawCpfCnpj : String(data.cnpj || "").replace(/\D/g, "");
-    const storeName = String(data.storeName || "").trim();
-    const razaoSocial = String(data.razaoSocial || "").trim();
-    const shoppingId = String(data.shoppingId || "").trim();
-    const shoppingName = data.shoppingName ? String(data.shoppingName) : null;
-    const phone = data.phone ? String(data.phone) : null;
-    const description = data.description ? String(data.description) : null;
-    const rawCategory = String(data.categoryId ?? data.category ?? "").trim().toLowerCase();
-    const { category } = categoryParam.parse({ category: rawCategory });
-    if (!STORE_CATEGORY_IDS.has(category)) {
-      throw new Error("invalid-category");
-    }
-
-    const resolvedCpfCnpj = rawCpfCnpj || rawCnpj;
-    if (!resolvedCpfCnpj || (resolvedCpfCnpj.length !== 11 && resolvedCpfCnpj.length !== 14)) {
-      throw new Error("invalid-cpf-cnpj");
-    }
-
-    if (!storeName || !razaoSocial || !shoppingId) {
-      throw new Error("invalid-payload");
-    }
+    const {
+      hasLogoField,
+      logoUrl,
+      rawCnpj,
+      resolvedCpfCnpj,
+      storeName,
+      razaoSocial,
+      shoppingId,
+      shoppingName,
+      phone,
+      description,
+      category
+    } = normalizeUpsertOwnerStoreInput(data);
 
     const ownerSnap = await db.collection("users").doc(uid).get();
     if (!ownerSnap.exists) throw new Error("user-not-found");

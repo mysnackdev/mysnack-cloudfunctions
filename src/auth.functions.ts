@@ -5,6 +5,62 @@ import { FieldValue } from "firebase-admin/firestore";
 import { handleErrors } from "./shared/errors.js";
 import { normalizeRole, getDefaultStatusForRole } from "./shared/auth.js";
 
+export function resolveCreateUserProfileInput(req: { auth?: any; data?: any }) {
+  const authUid = req.auth?.uid;
+  const data = (req.data || {}) as any;
+  const uid = String(data.uid || authUid || "");
+  if (!uid) throw new Error("uid-required");
+
+  const email = data.email ? String(data.email).trim() : (req.auth?.token?.email ?? null);
+  const rawName = data.name ?? req.auth?.token?.name ?? email ?? "Usuário";
+  const name = String(rawName).trim() || "Usuário";
+  const role = normalizeRole(data.role ?? req.auth?.token?.role);
+  const statusInput = data.status ? String(data.status).trim() : "";
+  const status = statusInput || getDefaultStatusForRole(role);
+  const storeName = data.storeName ? String(data.storeName).trim() : null;
+  const razaoSocial = data.razaoSocial ? String(data.razaoSocial).trim() : null;
+  const rawCpfCnpj = data.cpfCnpj ? String(data.cpfCnpj).replace(/\D/g, "") : null;
+  const cnpj = data.cnpj
+    ? String(data.cnpj).replace(/\D/g, "")
+    : rawCpfCnpj && rawCpfCnpj.length === 14
+      ? rawCpfCnpj
+      : null;
+  const cpfCnpj = rawCpfCnpj || cnpj || null;
+  const personType = data.personType
+    ? String(data.personType)
+    : cpfCnpj
+      ? (cpfCnpj.length === 11 ? "FISICA" : "JURIDICA")
+      : null;
+  const storeId = data.storeId
+    ? String(data.storeId)
+    : role === "store-owner" && cpfCnpj
+      ? cpfCnpj
+      : null;
+  const shoppingId = data.shoppingId ? String(data.shoppingId) : null;
+  const phone = data.phone ? String(data.phone) : null;
+  const birthDate = data.birthDate ? String(data.birthDate) : (data.birthdate ? String(data.birthdate) : null);
+  const photoURL = data.photoURL ? String(data.photoURL) : null;
+
+  return {
+    uid,
+    data,
+    email,
+    name,
+    role,
+    status,
+    storeName,
+    razaoSocial,
+    cnpj,
+    cpfCnpj,
+    personType,
+    storeId,
+    shoppingId,
+    phone,
+    birthDate,
+    photoURL
+  };
+}
+
 export const onUserCreate = user().onCreate(async (userRecord) => {
   const ref = db.collection("users").doc(userRecord.uid);
   const existing = await ref.get();
@@ -138,40 +194,24 @@ export const updateUserProfile = onCall({ region: "southamerica-east1" }, async 
 
 export const createUserProfile = onCall({ region: "southamerica-east1" }, async (req) => {
   return handleErrors(async () => {
-    const authUid = req.auth?.uid;
-    const data = (req.data || {}) as any;
-    const uid = String(data.uid || authUid || "");
-    if (!uid) throw new Error("uid-required");
-
-    const email = data.email ? String(data.email).trim() : (req.auth?.token?.email ?? null);
-    const rawName = data.name ?? req.auth?.token?.name ?? email ?? "Usuário";
-    const name = String(rawName).trim() || "Usuário";
-    const role = normalizeRole(data.role ?? req.auth?.token?.role);
-    const statusInput = data.status ? String(data.status).trim() : "";
-    const status = statusInput || getDefaultStatusForRole(role);
-    const storeName = data.storeName ? String(data.storeName).trim() : null;
-    const razaoSocial = data.razaoSocial ? String(data.razaoSocial).trim() : null;
-    const rawCpfCnpj = data.cpfCnpj ? String(data.cpfCnpj).replace(/\D/g, "") : null;
-    const cnpj = data.cnpj
-      ? String(data.cnpj).replace(/\D/g, "")
-      : rawCpfCnpj && rawCpfCnpj.length === 14
-      ? rawCpfCnpj
-      : null;
-    const cpfCnpj = rawCpfCnpj || cnpj || null;
-    const personType = data.personType
-      ? String(data.personType)
-      : cpfCnpj
-      ? (cpfCnpj.length === 11 ? "FISICA" : "JURIDICA")
-      : null;
-    const storeId = data.storeId
-      ? String(data.storeId)
-      : role === "store-owner" && cpfCnpj
-        ? cpfCnpj
-        : null;
-    const shoppingId = data.shoppingId ? String(data.shoppingId) : null;
-    const phone = data.phone ? String(data.phone) : null;
-    const birthDate = data.birthDate ? String(data.birthDate) : (data.birthdate ? String(data.birthdate) : null);
-    const photoURL = data.photoURL ? String(data.photoURL) : null;
+    const {
+      uid,
+      data,
+      email,
+      name,
+      role,
+      status,
+      storeName,
+      razaoSocial,
+      cnpj,
+      cpfCnpj,
+      personType,
+      storeId,
+      shoppingId,
+      phone,
+      birthDate,
+      photoURL
+    } = resolveCreateUserProfileInput(req);
     const timestamp = new Date().toISOString();
 
     const userRef = db.collection("users").doc(uid);
